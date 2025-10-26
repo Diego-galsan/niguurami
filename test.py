@@ -6,6 +6,12 @@ from typing import Any, Dict, Optional, Iterator
 
 import httpx
 from pydantic import BaseModel, PrivateAttr
+import asyncio
+from typing import AsyncGenerator, List
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
+from google.genai import types as genai_types
 
 # Optional dependency: botocore for SigV4 signing
 try:  # pragma: no cover - runtime check
@@ -439,7 +445,7 @@ def manual_bedrock_model() -> ManualSigV4Model:
     return ManualSigV4Model.from_env()
 
 
-class ManualSigV4Adapter(BaseModel):
+class ManualSigV4Adapter(BaseLlm):
     """Pydantic-friendly adapter that wraps ManualSigV4Model instance.
 
     This makes the runtime client an instance of a BaseModel so frameworks
@@ -449,6 +455,7 @@ class ManualSigV4Adapter(BaseModel):
     delegated to for `complete` and `stream_complete` calls.
     """
     model_type: str = "manual_sigv4"
+    model: str = "aws/bedrock.manual-sigv4"
     # runtime-only client
     _client: ManualSigV4Model = PrivateAttr()
 
@@ -463,3 +470,75 @@ class ManualSigV4Adapter(BaseModel):
 
     def stream_complete(self, prompt: str, max_tokens: int = 256, temperature: float = 0.2) -> Iterator[str]:
         return self._client.stream_complete(prompt, max_tokens=max_tokens, temperature=temperature)
+
+    # ---- BaseLlm required methods ----
+    @classmethod
+    def supported_models(cls) -> List[str]:
+        # Not used by registry in our integration; return a permissive list
+        return [".*"]
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        """Bridge ADK LlmRequest to our client and yield LlmResponse.
+
+        - Non-streaming: one LlmResponse with full text and turn_complete=True.
+        - Streaming: yield partial chunks as LlmResponse(partial=True), then a
+          final LlmResponse(turn_complete=True).
+        """
+        prompt = _contents_to_prompt(llm_request.contents)
+        # Pull common params if user set them in config
+        max_tokens = getattr(getattr(llm_request, 'config', None), 'max_output_tokens', 256) or 256
+        temperature = getattr(getattr(llm_request, 'config', None), 'temperature', 0.2) or 0.2
+
+        if not stream:
+            text = await asyncio.to_thread(self.complete, prompt, max_tokens, float(temperature))
+            yield _make_response(text, partial=False, turn_complete=True)
+            return
+
+        # Streaming path
+        accumulated = []
+        async def _iter_stream():
+            for delta in self.stream_complete(prompt, max_tokens=max_tokens, temperature=float(temperature)):
+                yield delta
+
+        async for delta in _iter_stream():
+            if not delta:
+                continue
+            accumulated.append(delta)
+            yield _make_response(delta, partial=True, turn_complete=False)
+
+        # Final message (optional, to indicate completion)
+        final_text = "".join(accumulated)
+        yield _make_response(final_text, partial=False, turn_complete=True)
+
+    def connect(self, llm_request: LlmRequest):  # noqa: D401 - documented in base
+        # Live connections are not supported for this manual client.
+        # ADK will fall back to generate_content_async when connect is not used.
+        raise NotImplementedError('Live connection is not supported for ManualSigV4Adapter')
+
+
+# ---- Small helpers to bridge ADK types to our client ----
+def _contents_to_prompt(contents: List[genai_types.Content]) -> str:
+    """Extract a user-friendly prompt by concatenating text parts."""
+    if not contents:
+        return ""
+    parts: List[str] = []
+    for c in contents:
+        for p in getattr(c, 'parts', []) or []:
+            txt = getattr(p, 'text', None)
+            if isinstance(txt, str) and txt:
+                parts.append(txt)
+    return "\n\n".join(parts).strip()
+
+
+def _make_response(text: str, *, partial: bool, turn_complete: bool) -> LlmResponse:
+    content = genai_types.Content(
+        role='model',
+        parts=[genai_types.Part(text=text or '')],
+    )
+    return LlmResponse(
+        content=content,
+        partial=partial,
+        turn_complete=turn_complete,
+    )
