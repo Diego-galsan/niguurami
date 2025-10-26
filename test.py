@@ -75,7 +75,10 @@ class ManualSigV4Model:
         self.creds = Credentials(access_key, secret_key, session_token)
         self.vpc_endpoint_url = vpc_endpoint_url.rstrip("/")
         self.model_id = model_id
-        self.gateway_url = gateway_url.rstrip("/")
+        # Preserve the gateway URL exactly as provided. Some gateways rely on
+        # a trailing slash for routing and will respond with 301 if it's
+        # missing. We no longer strip trailing slashes here.
+        self.gateway_url = gateway_url
         self.verify_tls = verify_tls
         self.timeout = timeout
         self.debug = debug
@@ -96,6 +99,9 @@ class ManualSigV4Model:
                 verify=self.verify_tls,
                 trust_env=False,  # Avoid picking HTTPS_PROXY; we are NOT using CONNECT
                 http2=http2_enabled,
+                # Follow redirects to avoid failing on 301/302 when the
+                # gateway enforces trailing slash or performs permanent moves.
+                follow_redirects=True,
             )
         except ImportError:
             # Safety net: if http2 import error occurs, retry without http2
@@ -104,6 +110,7 @@ class ManualSigV4Model:
                 verify=self.verify_tls,
                 trust_env=False,
                 http2=False,
+                follow_redirects=True,
             )
 
     @classmethod
