@@ -5,6 +5,7 @@ import hashlib
 from typing import Any, Dict, Optional, Iterator
 
 import httpx
+from pydantic import BaseModel, PrivateAttr
 
 # Optional dependency: botocore for SigV4 signing
 try:  # pragma: no cover - runtime check
@@ -418,3 +419,29 @@ class ManualSigV4Model:
 def manual_bedrock_model() -> ManualSigV4Model:
     """Explicit factory for ManualSigV4Model using env vars."""
     return ManualSigV4Model.from_env()
+
+
+class ManualSigV4Adapter(BaseModel):
+    """Pydantic-friendly adapter that wraps ManualSigV4Model instance.
+
+    This makes the runtime client an instance of a BaseModel so frameworks
+    that validate model inputs with pydantic (like google.adk) accept it.
+
+    The actual HTTP/Signing client is stored in a private attribute and
+    delegated to for `complete` and `stream_complete` calls.
+    """
+    model_type: str = "manual_sigv4"
+    # runtime-only client
+    _client: ManualSigV4Model = PrivateAttr()
+
+    @classmethod
+    def from_env(cls) -> "ManualSigV4Adapter":
+        inst = cls()
+        inst._client = ManualSigV4Model.from_env()
+        return inst
+
+    def complete(self, prompt: str, max_tokens: int = 256, temperature: float = 0.2) -> str:
+        return self._client.complete(prompt, max_tokens=max_tokens, temperature=temperature)
+
+    def stream_complete(self, prompt: str, max_tokens: int = 256, temperature: float = 0.2) -> Iterator[str]:
+        return self._client.stream_complete(prompt, max_tokens=max_tokens, temperature=temperature)
