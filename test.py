@@ -16,6 +16,13 @@ try:  # pragma: no cover - runtime check
 except Exception:  # pragma: no cover - will be handled at runtime
         _HAS_BOTOCORE = False
 
+# Optional dependency: h2 for HTTP/2 support in httpx
+try:  # pragma: no cover - runtime check
+    import h2  # type: ignore
+    _HAS_H2 = True
+except Exception:  # pragma: no cover
+    _HAS_H2 = False
+
 class ManualSigV4Model:
     """Minimal model wrapper to call AWS Bedrock via VPC endpoint with SigV4,
     sending the signed request to a corporate Application Gateway without using
@@ -75,12 +82,23 @@ class ManualSigV4Model:
         self.vpc_host = parsed.netloc
 
         # Pre-create HTTP client to Host B (Application Gateway)
-        self.client = httpx.Client(
-            timeout=httpx.Timeout(self.timeout),
-            verify=self.verify_tls,
-            trust_env=False,  # Avoid picking HTTPS_PROXY; we are NOT using CONNECT
-            http2=True,
-        )
+        # Use HTTP/2 only if h2 is available; fallback to HTTP/1.1 otherwise.
+        http2_enabled = _HAS_H2
+        try:
+            self.client = httpx.Client(
+                timeout=httpx.Timeout(self.timeout),
+                verify=self.verify_tls,
+                trust_env=False,  # Avoid picking HTTPS_PROXY; we are NOT using CONNECT
+                http2=http2_enabled,
+            )
+        except ImportError:
+            # Safety net: if http2 import error occurs, retry without http2
+            self.client = httpx.Client(
+                timeout=httpx.Timeout(self.timeout),
+                verify=self.verify_tls,
+                trust_env=False,
+                http2=False,
+            )
 
     @classmethod
     def from_env(cls) -> "ManualSigV4Model":
