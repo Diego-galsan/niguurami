@@ -252,6 +252,8 @@ class ManualSigV4Model:
                     r.close()
                     # Re-open the stream at the redirect target
                     with self.client.stream("POST", redirect_url, headers=headers, content=body_bytes) as r2:
+                        if r2.status_code >= 400:
+                            self._debug_http_error(r2, "stream redirect target")
                         r2.raise_for_status()
                         ctype = (r2.headers.get("content-type") or "").lower()
                         if "application/vnd.amazon.eventstream" in ctype:
@@ -265,6 +267,8 @@ class ManualSigV4Model:
                             if text:
                                 yield text
                     return
+            if r.status_code >= 400:
+                self._debug_http_error(r, "stream initial")
             r.raise_for_status()
             ctype = (r.headers.get("content-type") or "").lower()
             if "application/vnd.amazon.eventstream" in ctype:
@@ -457,6 +461,8 @@ class ManualSigV4Model:
                     headers=signed["headers"],
                     content=signed["body"],
                 )
+        if r.status_code >= 400:
+            self._debug_http_error(r, "invoke")
         r.raise_for_status()
         try:
             return r.json()
@@ -482,27 +488,45 @@ class ManualSigV4Model:
         joined_path = "/" + "/".join(pieces)
         return urlunparse((bp.scheme, bp.netloc, joined_path, "", "", ""))
 
-        def _build_redirect_url(self, current_url: str, location: str, intended_path: str) -> str:
-                """Build a safe redirect target.
+    def _build_redirect_url(self, current_url: str, location: str, intended_path: str) -> str:
+        """Build a safe redirect target.
 
-                - If Location is absolute and points to a different host (e.g., directly to the VPC endpoint),
-                    reconstruct the target using the intended Bedrock path to avoid wrong prefixes like '/claude/'.
-                - Otherwise, resolve relative redirects against the current URL.
-                """
-                from urllib.parse import urlparse, urljoin, urlunparse
+        - If Location is absolute and points to a different host (e.g., directly to the VPC endpoint),
+          reconstruct the target using the intended Bedrock path to avoid wrong prefixes like '/claude/'.
+        - Otherwise, resolve relative redirects against the current URL.
+        """
+        from urllib.parse import urlparse, urljoin, urlunparse
 
-                cur = urlparse(current_url)
-                loc = urlparse(location)
+        cur = urlparse(current_url)
+        loc = urlparse(location)
 
-                # Absolute redirect to another host (often the VPC endpoint)
-                if loc.scheme and loc.netloc and (loc.netloc != cur.netloc):
-                        # Keep scheme+host from Location, but enforce correct Bedrock path
-                        new_path = intended_path if intended_path.startswith("/") else "/" + intended_path
-                        return urlunparse((loc.scheme, loc.netloc, new_path, "", "", ""))
+        # Absolute redirect to another host (often the VPC endpoint)
+        if loc.scheme and loc.netloc and (loc.netloc != cur.netloc):
+            # Keep scheme+host from Location, but enforce correct Bedrock path
+            new_path = intended_path if intended_path.startswith("/") else "/" + intended_path
+            return urlunparse((loc.scheme, loc.netloc, new_path, "", "", ""))
 
-                # Otherwise, relative or same-host redirect; resolve normally and keep path
-                base = current_url + ("/" if not current_url.endswith("/") else "")
-                return urljoin(base, location)
+        # Otherwise, relative or same-host redirect; resolve normally and keep path
+        base = current_url + ("/" if not current_url.endswith("/") else "")
+        return urljoin(base, location)
+
+    def _debug_http_error(self, r: httpx.Response, where: str) -> None:
+        """Print helpful diagnostics for HTTP errors when debug is enabled."""
+        if not self.debug:
+            return
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        # Avoid dumping sensitive auth header
+        headers_sample = {k: (v if k.lower() != "authorization" else "<redacted>") for k, v in r.request.headers.items()}
+        print(f"[ManualSigV4] HTTP error at {where}: {r.status_code} {r.reason_phrase}")
+        try:
+            print("[ManualSigV4] URL:", str(r.request.url))
+        except Exception:
+            pass
+        print("[ManualSigV4] Request headers:", headers_sample)
+        print("[ManualSigV4] Response body:", body)
 
     def _build_signed_request(self, *, method: str, path: str, query_string: str, body: bytes) -> Dict[str, Any]:
         # Construct the URL for Host A (used only for signing values)
