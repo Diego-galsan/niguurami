@@ -99,9 +99,6 @@ class ManualSigV4Model:
                 verify=self.verify_tls,
                 trust_env=False,  # Avoid picking HTTPS_PROXY; we are NOT using CONNECT
                 http2=http2_enabled,
-                # Follow redirects to avoid failing on 301/302 when the
-                # gateway enforces trailing slash or performs permanent moves.
-                follow_redirects=True,
             )
         except ImportError:
             # Safety net: if http2 import error occurs, retry without http2
@@ -110,7 +107,6 @@ class ManualSigV4Model:
                 verify=self.verify_tls,
                 trust_env=False,
                 http2=False,
-                follow_redirects=True,
             )
 
     @classmethod
