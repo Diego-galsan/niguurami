@@ -229,6 +229,30 @@ class ManualSigV4Model:
             print("[ManualSigV4] Authorization prefix:", headers.get("authorization", "")[:48], "...")
 
         with self.client.stream("POST", url, headers=headers, content=body_bytes) as r:
+            # Handle trailing-slash redirects for streaming as well
+            if r.status_code in (301, 302, 307, 308):
+                loc = r.headers.get("location") or r.headers.get("Location")
+                if loc:
+                    from urllib.parse import urljoin
+                    redirect_url = urljoin(url + ("/" if not url.endswith("/") else ""), loc)
+                    if self.debug:
+                        print(f"[ManualSigV4] STREAM redirect {r.status_code} -> {redirect_url}")
+                    r.close()
+                    # Re-open the stream at the redirect target
+                    with self.client.stream("POST", redirect_url, headers=headers, content=body_bytes) as r2:
+                        r2.raise_for_status()
+                        ctype = (r2.headers.get("content-type") or "").lower()
+                        if "application/vnd.amazon.eventstream" in ctype:
+                            yield from self._iter_eventstream_text(r2)
+                        else:
+                            try:
+                                data = r2.json()
+                            except Exception:
+                                data = {"raw": r2.text}
+                            text = self._first_text_from_response(data)
+                            if text:
+                                yield text
+                    return
             r.raise_for_status()
             ctype = (r.headers.get("content-type") or "").lower()
             if "application/vnd.amazon.eventstream" in ctype:
@@ -401,6 +425,25 @@ class ManualSigV4Model:
             headers=signed["headers"],
             content=signed["body"],
         )
+        # Handle common gateway redirects caused by missing trailing slash
+        if r.status_code in (301, 302, 307, 308):
+            loc = r.headers.get("location") or r.headers.get("Location")
+            if loc:
+                try:
+                    from urllib.parse import urljoin
+                    # If it's a relative redirect, resolve against current URL
+                    redirect_url = urljoin(url + ("/" if not url.endswith("/") else ""), loc)
+                except Exception:
+                    redirect_url = loc
+                if self.debug:
+                    print(f"[ManualSigV4] Redirect {r.status_code} -> {redirect_url}")
+                # Re-issue POST to the redirect target preserving body/headers
+                r.close()
+                r = self.client.post(
+                    redirect_url,
+                    headers=signed["headers"],
+                    content=signed["body"],
+                )
         r.raise_for_status()
         try:
             return r.json()
