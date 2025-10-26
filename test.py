@@ -142,7 +142,9 @@ class ManualSigV4Model:
         model_id = os.getenv("AWS_BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1")
         gateway_url = os.getenv("CORPORATE_GATEWAY_URL") or os.getenv("CORPORATE_PROXY", "")
         verify_tls = str(os.getenv("PROXY_SSL_VERIFY", "true")).lower() not in {"0", "false", "no"}
-        debug = str(os.getenv("DEBUG_AWS_REQUESTS", "")).lower() in {"1", "true", "yes"}
+        # Force debug logs for now (hardcoded as requested). Revert to env-based toggle later.
+        # debug = str(os.getenv("DEBUG_AWS_REQUESTS", "")).lower() in {"1", "true", "yes"}
+        debug = True
 
         missing = []
         if not access_key:
@@ -231,7 +233,10 @@ class ManualSigV4Model:
         path = f"/model/{self.model_id}/invoke-with-response-stream"
 
         # For streaming, include Accept header so Bedrock returns eventstream
-        body_bytes = json.dumps(body).encode("utf-8")
+        # IMPORTANT: Use compact JSON to avoid whitespace differences that
+        # gateways might introduce when re-serializing. This ensures the
+        # x-amz-content-sha256 hash (used in SigV4) matches the payload AWS receives.
+        body_bytes = json.dumps(body, separators=(',', ':')).encode("utf-8")
         signed = self._build_signed_request(
             method="POST",
             path=path,
@@ -256,6 +261,14 @@ class ManualSigV4Model:
             print("[ManualSigV4] Host header (gateway hop):", headers.get("host"))
             print("[ManualSigV4] Signed Host (VPC):", signed["headers"].get("host"))
             print("[ManualSigV4] Authorization prefix:", headers.get("authorization", "")[:48], "...")
+            self._debug_request_preview(
+                where="stream-initial",
+                method="POST",
+                url=url,
+                headers=headers,
+                body=body_bytes,
+                signed_host=signed["headers"].get("host"),
+            )
 
         # reset stop flag for this stream
         self._stream_should_stop = False
@@ -275,6 +288,15 @@ class ManualSigV4Model:
                     _redir_host = _urlparse(redirect_url).netloc
                     _headers_redirect = dict(headers)
                     _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
+                    # Preview redirect request
+                    self._debug_request_preview(
+                        where="stream-redirect",
+                        method="POST",
+                        url=redirect_url,
+                        headers=_headers_redirect,
+                        body=body_bytes,
+                        signed_host=signed["headers"].get("host"),
+                    )
                     with self.client.stream("POST", redirect_url, headers=_headers_redirect, content=body_bytes) as r2:
                         if r2.status_code >= 400:
                             self._debug_http_error(r2, "stream redirect target")
@@ -454,7 +476,8 @@ class ManualSigV4Model:
             method="POST",
             path=path,
             query_string="",
-            body=json.dumps(body).encode("utf-8"),
+            # IMPORTANT: compact JSON to ensure hash matches payload AWS receives
+            body=json.dumps(body, separators=(',', ':')).encode("utf-8"),
         )
 
         # Send to Host B (Application Gateway) joining base gateway path with Bedrock path
@@ -463,6 +486,14 @@ class ManualSigV4Model:
             print("[ManualSigV4] POST ->", url)
             print("[ManualSigV4] Signed Host (VPC):", signed["headers"].get("host"))
             print("[ManualSigV4] Authorization prefix:", signed["headers"].get("authorization", "")[:48], "...")
+            self._debug_request_preview(
+                where="invoke-initial",
+                method="POST",
+                url=url,
+                headers=headers,
+                body=signed["body"],
+                signed_host=signed["headers"].get("host"),
+            )
 
         # Important: We SIGN with the VPC host, but we SEND with the gateway host.
         # Gateways often require Host to match their own name; they should
@@ -488,6 +519,15 @@ class ManualSigV4Model:
                 _redir_host = _urlparse(redirect_url).netloc
                 _headers_redirect = dict(signed["headers"])  # start from original signed headers
                 _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
+                # Preview redirect request
+                self._debug_request_preview(
+                    where="invoke-redirect",
+                    method="POST",
+                    url=redirect_url,
+                    headers=_headers_redirect,
+                    body=signed["body"],
+                    signed_host=signed["headers"].get("host"),
+                )
                 r = self.client.post(
                     redirect_url,
                     headers=_headers_redirect,
@@ -541,6 +581,69 @@ class ManualSigV4Model:
         # Otherwise, relative or same-host redirect; resolve normally and keep path
         base = current_url + ("/" if not current_url.endswith("/") else "")
         return urljoin(base, location)
+
+    # --- Debug helpers ---
+    def _sanitize_headers_for_log(self, headers: Dict[str, Any]) -> Dict[str, Any]:
+        if not headers:
+            return {}
+        out: Dict[str, Any] = {}
+        for k, v in headers.items():
+            kl = str(k).lower()
+            if kl in {"authorization", "proxy-authorization"}:
+                out[k] = "<redacted>"
+            elif kl in {"x-amz-security-token"}:
+                try:
+                    sv = str(v)
+                    out[k] = (sv[:6] + "..." + sv[-4:]) if len(sv) > 12 else "<redacted>"
+                except Exception:
+                    out[k] = "<redacted>"
+            else:
+                out[k] = v
+        return out
+
+    def _debug_request_preview(
+        self,
+        *,
+        where: str,
+        method: str,
+        url: str,
+        headers: Dict[str, Any],
+        body: Optional[bytes],
+        signed_host: Optional[str] = None,
+    ) -> None:
+        if not self.debug:
+            return
+        try:
+            print(f"[ManualSigV4][{where}] {method} {url}")
+            print(f"[ManualSigV4][{where}] Host header (outbound): {headers.get('host')}")
+            if signed_host:
+                print(f"[ManualSigV4][{where}] Signed Host (VPC): {signed_host}")
+            # Show SignedHeaders list from Authorization without exposing signature
+            auth = headers.get("authorization")
+            if isinstance(auth, str):
+                parts = auth.split(",")
+                sh = next((p.split("=",1)[1] for p in parts if "SignedHeaders=" in p), None)
+                alg = auth.split(" ", 1)[0] if " " in auth else "AWS4-HMAC-SHA256"
+                print(f"[ManualSigV4][{where}] Auth alg: {alg}; SignedHeaders: {sh}")
+            # Hash check
+            hdr_hash = headers.get("x-amz-content-sha256")
+            computed = hashlib.sha256(body or b"").hexdigest()
+            match = "OK" if hdr_hash == computed else "MISMATCH"
+            print(f"[ManualSigV4][{where}] x-amz-content-sha256 hdr={hdr_hash} computed={computed} [{match}]")
+            # Headers (sanitized)
+            print(f"[ManualSigV4][{where}] Headers: {self._sanitize_headers_for_log(headers)}")
+            # Body preview (first 512 chars)
+            if body:
+                try:
+                    s = body.decode("utf-8", errors="replace")
+                except Exception:
+                    s = "<binary>"
+                preview = s[:512]
+                print(f"[ManualSigV4][{where}] Body(len={len(body)}): {preview}")
+            else:
+                print(f"[ManualSigV4][{where}] Body: <empty>")
+        except Exception as e:
+            print(f"[ManualSigV4][{where}] debug preview failed: {e}")
 
     def _debug_http_error(self, r: httpx.Response, where: str) -> None:
         """Print helpful diagnostics for HTTP errors when debug is enabled."""
