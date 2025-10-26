@@ -90,12 +90,22 @@ class ManualSigV4Model:
             raise ValueError("AWS_BEDROCK_VPC_ENDPOINT must be a full https URL")
         self.vpc_host = parsed.netloc
 
+        # Internal flag to stop consuming a stream when provider signals completion
+        self._stream_should_stop = False
+
         # Pre-create HTTP client to Host B (Application Gateway)
         # Use HTTP/2 only if h2 is available; fallback to HTTP/1.1 otherwise.
         http2_enabled = _HAS_H2
+        # Granular timeouts to avoid hangs on slow proxies/streams
+        timeout_cfg = httpx.Timeout(
+            connect=self.timeout,
+            read=self.timeout,
+            write=self.timeout,
+            pool=self.timeout,
+        )
         try:
             self.client = httpx.Client(
-                timeout=httpx.Timeout(self.timeout),
+                timeout=timeout_cfg,
                 verify=self.verify_tls,
                 trust_env=False,  # Avoid picking HTTPS_PROXY; we are NOT using CONNECT
                 http2=http2_enabled,
@@ -103,7 +113,7 @@ class ManualSigV4Model:
         except ImportError:
             # Safety net: if http2 import error occurs, retry without http2
             self.client = httpx.Client(
-                timeout=httpx.Timeout(self.timeout),
+                timeout=timeout_cfg,
                 verify=self.verify_tls,
                 trust_env=False,
                 http2=False,
@@ -222,19 +232,21 @@ class ManualSigV4Model:
         headers = dict(signed["headers"])  # copy
         headers.setdefault("accept", "application/vnd.amazon.eventstream")
 
-        url = self.gateway_url
+        # Build the forward URL by joining the gateway base path with the Bedrock path
+        url = self._gateway_join(path)
         if self.debug:
             print("[ManualSigV4] STREAM POST ->", url)
             print("[ManualSigV4] Using Host header for VPC:", headers.get("host"))
             print("[ManualSigV4] Authorization prefix:", headers.get("authorization", "")[:48], "...")
 
+        # reset stop flag for this stream
+        self._stream_should_stop = False
         with self.client.stream("POST", url, headers=headers, content=body_bytes) as r:
             # Handle trailing-slash redirects for streaming as well
             if r.status_code in (301, 302, 307, 308):
                 loc = r.headers.get("location") or r.headers.get("Location")
                 if loc:
-                    from urllib.parse import urljoin
-                    redirect_url = urljoin(url + ("/" if not url.endswith("/") else ""), loc)
+                    redirect_url = self._build_redirect_url(url, loc, path)
                     if self.debug:
                         print(f"[ManualSigV4] STREAM redirect {r.status_code} -> {redirect_url}")
                     r.close()
@@ -350,6 +362,8 @@ class ManualSigV4Model:
                             for piece in self._iter_provider_stream(provider_bytes):
                                 if piece:
                                     yield piece
+                            if self._stream_should_stop:
+                                return
                         except Exception:
                             # If decode fails, ignore this chunk
                             continue
@@ -390,8 +404,12 @@ class ManualSigV4Model:
             elif obj.get("type") == "message_delta":
                 # Some models send trailing updates; no direct text chunk
                 continue
-            elif obj.get("type") in {"message_start", "content_block_start", "message_stop"}:
+            elif obj.get("type") in {"message_start", "content_block_start"}:
                 # Control events; ignore
+                continue
+            elif obj.get("type") == "message_stop":
+                # Signal outer loop to stop consuming
+                self._stream_should_stop = True
                 continue
             else:
                 # Try generic text holders if present
@@ -411,8 +429,8 @@ class ManualSigV4Model:
             body=json.dumps(body).encode("utf-8"),
         )
 
-        # Send to Host B (Application Gateway) as a regular HTTPS POST
-        url = self.gateway_url  # Full URL like https://aws-ia-dev.../claude
+        # Send to Host B (Application Gateway) joining base gateway path with Bedrock path
+        url = self._gateway_join(path)
         if self.debug:
             print("[ManualSigV4] POST ->", url)
             print("[ManualSigV4] Using Host header for VPC:", signed["headers"].get("host"))
@@ -425,16 +443,11 @@ class ManualSigV4Model:
             headers=signed["headers"],
             content=signed["body"],
         )
-        # Handle common gateway redirects caused by missing trailing slash
+        # Handle common gateway redirects caused by missing trailing slash or host change
         if r.status_code in (301, 302, 307, 308):
             loc = r.headers.get("location") or r.headers.get("Location")
             if loc:
-                try:
-                    from urllib.parse import urljoin
-                    # If it's a relative redirect, resolve against current URL
-                    redirect_url = urljoin(url + ("/" if not url.endswith("/") else ""), loc)
-                except Exception:
-                    redirect_url = loc
+                redirect_url = self._build_redirect_url(url, loc, path)
                 if self.debug:
                     print(f"[ManualSigV4] Redirect {r.status_code} -> {redirect_url}")
                 # Re-issue POST to the redirect target preserving body/headers
@@ -450,6 +463,46 @@ class ManualSigV4Model:
         except Exception:
             # Some gateways wrap payload; try to unwrap or return raw
             return {"raw": r.text}
+
+    # --- URL helper ---
+    def _gateway_join(self, extra_path: str) -> str:
+        """Join the corporate gateway base URL with the Bedrock path.
+
+        Preserves gateway base path segments (e.g., '/claude') and appends the
+        Bedrock path (e.g., '/model/...'). Avoids losing base path which can
+        happen with urljoin when the second path starts with '/'.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        base = self.gateway_url
+        bp = urlparse(base)
+        base_path = (bp.path or "/").strip("/")
+        add_path = (extra_path or "").strip("/")
+        pieces = [p for p in [base_path, add_path] if p]
+        joined_path = "/" + "/".join(pieces)
+        return urlunparse((bp.scheme, bp.netloc, joined_path, "", "", ""))
+
+        def _build_redirect_url(self, current_url: str, location: str, intended_path: str) -> str:
+                """Build a safe redirect target.
+
+                - If Location is absolute and points to a different host (e.g., directly to the VPC endpoint),
+                    reconstruct the target using the intended Bedrock path to avoid wrong prefixes like '/claude/'.
+                - Otherwise, resolve relative redirects against the current URL.
+                """
+                from urllib.parse import urlparse, urljoin, urlunparse
+
+                cur = urlparse(current_url)
+                loc = urlparse(location)
+
+                # Absolute redirect to another host (often the VPC endpoint)
+                if loc.scheme and loc.netloc and (loc.netloc != cur.netloc):
+                        # Keep scheme+host from Location, but enforce correct Bedrock path
+                        new_path = intended_path if intended_path.startswith("/") else "/" + intended_path
+                        return urlunparse((loc.scheme, loc.netloc, new_path, "", "", ""))
+
+                # Otherwise, relative or same-host redirect; resolve normally and keep path
+                base = current_url + ("/" if not current_url.endswith("/") else "")
+                return urljoin(base, location)
 
     def _build_signed_request(self, *, method: str, path: str, query_string: str, body: bytes) -> Dict[str, Any]:
         # Construct the URL for Host A (used only for signing values)
