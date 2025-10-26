@@ -46,10 +46,17 @@ class ManualSigV4Model:
     - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
     - AWS_BEDROCK_VPC_ENDPOINT: full https URL for Host A (vpce-*.vpce.amazonaws.com)
     - AWS_BEDROCK_MODEL_ID: e.g., anthropic.claude-3-5-sonnet-20240620-v1
-    - CORPORATE_GATEWAY_URL: full https URL for Host B (e.g., https://aws-ia-dev.../claude)
+        - CORPORATE_GATEWAY_URL: full https URL for Host B (e.g., https://aws-ia-dev.../claude)
       If not set, falls back to CORPORATE_PROXY for backward compatibility.
     - PROXY_SSL_VERIFY: "false" to disable TLS verification when calling Host B (testing only)
     - DEBUG_AWS_REQUESTS: enable debug prints
+
+        Important behavior:
+        - We SIGN with the AWS VPC endpoint host (Host A) but we SEND with the
+            corporate gateway host (Host B). Many gateways require the Host header to
+            match their own hostname, and they will rewrite it back to the VPC host
+            when forwarding to AWS. Redirects are handled carefully so the Host
+            header always matches the actual target host of that hop.
     """
 
     def __init__(
@@ -64,7 +71,7 @@ class ManualSigV4Model:
         gateway_url: str,
         verify_tls: bool = True,
         timeout: float = 30.0,
-        debug: bool = True,
+        debug: bool = False,
     ) -> None:
         if not _HAS_BOTOCORE:
             raise RuntimeError(
@@ -89,6 +96,12 @@ class ManualSigV4Model:
         if parsed.scheme != "https" or not parsed.netloc:
             raise ValueError("AWS_BEDROCK_VPC_ENDPOINT must be a full https URL")
         self.vpc_host = parsed.netloc
+
+        # Resolve Gateway host (Host B) for the outward HTTP request
+        gparsed = urlparse(self.gateway_url)
+        if gparsed.scheme != "https" or not gparsed.netloc:
+            raise ValueError("CORPORATE_GATEWAY_URL must be a full https URL")
+        self.gateway_host = gparsed.netloc
 
         # Internal flag to stop consuming a stream when provider signals completion
         self._stream_should_stop = False
@@ -229,14 +242,19 @@ class ManualSigV4Model:
         # Add Accept header (not required for signature validation to pass),
         # OK to add even if not originally signed because SigV4 validates the
         # canonical signed headers subset.
-        headers = dict(signed["headers"])  # copy
+        headers = dict(signed["headers"])  # copy of signed headers (host=vpc_host)
         headers.setdefault("accept", "application/vnd.amazon.eventstream")
+        # OUTBOUND OVERRIDE: When sending to the gateway, its Host must match
+        # the gateway's hostname. The gateway should restore the VPC Host when
+        # forwarding to AWS so the signature remains valid upstream.
+        headers["host"] = self.gateway_host
 
         # Build the forward URL by joining the gateway base path with the Bedrock path
         url = self._gateway_join(path)
         if self.debug:
             print("[ManualSigV4] STREAM POST ->", url)
-            print("[ManualSigV4] Using Host header for VPC:", headers.get("host"))
+            print("[ManualSigV4] Host header (gateway hop):", headers.get("host"))
+            print("[ManualSigV4] Signed Host (VPC):", signed["headers"].get("host"))
             print("[ManualSigV4] Authorization prefix:", headers.get("authorization", "")[:48], "...")
 
         # reset stop flag for this stream
@@ -251,7 +269,13 @@ class ManualSigV4Model:
                         print(f"[ManualSigV4] STREAM redirect {r.status_code} -> {redirect_url}")
                     r.close()
                     # Re-open the stream at the redirect target
-                    with self.client.stream("POST", redirect_url, headers=headers, content=body_bytes) as r2:
+                    # Adjust Host for the redirect hop: if redirect target is the gateway,
+                    # keep gateway Host; if it's the VPC endpoint, restore VPC Host.
+                    from urllib.parse import urlparse as _urlparse
+                    _redir_host = _urlparse(redirect_url).netloc
+                    _headers_redirect = dict(headers)
+                    _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
+                    with self.client.stream("POST", redirect_url, headers=_headers_redirect, content=body_bytes) as r2:
                         if r2.status_code >= 400:
                             self._debug_http_error(r2, "stream redirect target")
                         r2.raise_for_status()
@@ -437,14 +461,17 @@ class ManualSigV4Model:
         url = self._gateway_join(path)
         if self.debug:
             print("[ManualSigV4] POST ->", url)
-            print("[ManualSigV4] Using Host header for VPC:", signed["headers"].get("host"))
+            print("[ManualSigV4] Signed Host (VPC):", signed["headers"].get("host"))
             print("[ManualSigV4] Authorization prefix:", signed["headers"].get("authorization", "")[:48], "...")
 
-        # Important: we forward the exact signed headers so AWS validates SigV4.
-        # The gateway must transparently forward method, path, headers and body to Host A.
+        # Important: We SIGN with the VPC host, but we SEND with the gateway host.
+        # Gateways often require Host to match their own name; they should
+        # restore the original Host (VPC) when forwarding to AWS.
+        headers = dict(signed["headers"])  # copy to avoid mutating signed headers
+        headers["host"] = self.gateway_host
         r = self.client.post(
             url,
-            headers=signed["headers"],
+            headers=headers,
             content=signed["body"],
         )
         # Handle common gateway redirects caused by missing trailing slash or host change
@@ -456,9 +483,14 @@ class ManualSigV4Model:
                     print(f"[ManualSigV4] Redirect {r.status_code} -> {redirect_url}")
                 # Re-issue POST to the redirect target preserving body/headers
                 r.close()
+                # Adjust Host for the redirect hop similar to streaming
+                from urllib.parse import urlparse as _urlparse
+                _redir_host = _urlparse(redirect_url).netloc
+                _headers_redirect = dict(signed["headers"])  # start from original signed headers
+                _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
                 r = self.client.post(
                     redirect_url,
-                    headers=signed["headers"],
+                    headers=_headers_redirect,
                     content=signed["body"],
                 )
         if r.status_code >= 400:
