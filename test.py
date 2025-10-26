@@ -64,7 +64,7 @@ class ManualSigV4Model:
         gateway_url: str,
         verify_tls: bool = True,
         timeout: float = 30.0,
-        debug: bool = False,
+        debug: bool = True,
     ) -> None:
         if not _HAS_BOTOCORE:
             raise RuntimeError(
