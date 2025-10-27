@@ -167,7 +167,8 @@ class ManualSigV4Model:
             model_id=model_id,
             gateway_url=gateway_url,
             verify_tls=verify_tls,
-            timeout=float(os.getenv("AWS_HTTP_TIMEOUT", "30")),
+            # Aumentamos el timeout por defecto para streams largos (configurable por env)
+            timeout=float(os.getenv("AWS_HTTP_TIMEOUT", "300")),
             debug=debug,
         )
 
@@ -985,9 +986,10 @@ class ManualSigV4Adapter(BaseLlm):
         response_mime = str(getattr(config, 'response_mime_type', '') or '').lower()
         expects_json = 'json' in response_mime
 
-        # Auto-select streaming by response mime (e.g., text/event-stream, message/stream)
-        # Controlled by ADK_AUTO_STREAM_FROM_MIME (default on). This lets a curl with
-        # Accept: text/event-stream or response_mime_type=message/stream enable streaming.
+        # Auto-select streaming signals
+        # - Por MIME (e.g., text/event-stream, message/stream)
+        # - Por flag de llamada (stream=True)
+        # - Por defecto configurable (ADK_STREAM_DEFAULT, default=on)
         try:
             auto_stream_from_mime = str(os.getenv("ADK_AUTO_STREAM_FROM_MIME", "1")).lower() in {"1", "true", "yes"}
         except Exception:
@@ -1031,28 +1033,14 @@ class ManualSigV4Adapter(BaseLlm):
         except Exception:
             tool_decls = []
 
-        # Streaming defaults: enable streaming by default unless explicitly disabled
+        # Streaming defaults: habilitar streaming por defecto, salvo que el llamante lo desactive explícitamente
         try:
             stream_default = str(os.getenv("ADK_STREAM_DEFAULT", "1")).lower() in {"1", "true", "yes"}
         except Exception:
             stream_default = True
-        # SOLO AUTO behavior: by default we honor MIME but also respect the runtime 'stream' flag
-        # if provided (so message/stream RPCs still stream even if MIME wasn't propagated).
-        # To enforce strict "MIME-only" mode, set ADK_SOLO_AUTO_STRICT=1.
-        try:
-            solo_auto_strict = str(os.getenv("ADK_SOLO_AUTO_STRICT", "0")).lower() in {"1", "true", "yes"}
-        except Exception:
-            solo_auto_strict = False
         incoming_stream_arg = bool(stream)
-        if auto_stream_from_mime:
-            if solo_auto_strict:
-                stream = wants_stream_by_mime
-            else:
-                # Prefer MIME signal but allow upstream to force streaming via stream=True
-                stream = wants_stream_by_mime or incoming_stream_arg
-        else:
-            if not stream and stream_default:
-                stream = True
+        # Decisión final: si cualquiera lo pide (flag, MIME, default), stream=True
+        stream = incoming_stream_arg or wants_stream_by_mime or stream_default
 
         if debug_stream:
             try:
@@ -1064,7 +1052,6 @@ class ManualSigV4Adapter(BaseLlm):
                             "auto_stream_from_mime": auto_stream_from_mime,
                             "wants_stream_by_mime": wants_stream_by_mime,
                             "incoming_stream_arg": incoming_stream_arg,
-                            "solo_auto_strict": solo_auto_strict,
                             "expects_json": expects_json,
                             "final_stream": stream,
                         },
@@ -1092,7 +1079,7 @@ class ManualSigV4Adapter(BaseLlm):
         except Exception:
             tool_args_delta_format = "text"
 
-        # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides.
+        # Convert ADK contents into Anthropic-compatible body, preserving system prompts y añadiendo (opcional) espejo de idioma.
         # Also attach tools and tool_choice when provided.
         body = _contents_to_anthropic_body(
             llm_request.contents,
@@ -1401,6 +1388,15 @@ def _contents_to_anthropic_body(
     # If caller provided overrides, append them after the collected system parts
     if isinstance(system_override, str) and system_override.strip():
         system_parts.append(system_override.strip())
+    # Language mirror: instrucción para responder en el idioma del usuario, habilitada por defecto
+    try:
+        language_mirror_on = str(os.getenv('ADK_LANGUAGE_MIRROR', '1')).lower() in {"1", "true", "yes"}
+    except Exception:
+        language_mirror_on = True
+    if language_mirror_on:
+        system_parts.append(
+            "Responde en el mismo idioma que el usuario. Si el usuario usa español, responde en español."
+        )
     system_text = "\n\n".join(system_parts).strip()
     if system_text:
         body['system'] = system_text
