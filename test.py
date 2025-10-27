@@ -343,7 +343,11 @@ class ManualSigV4Model:
         return self._invoke_bedrock(payload)
 
     def stream_body(self, body: Dict[str, Any]) -> Iterator[str]:
-        """Stream Bedrock with a pre-built Anthropic-compatible body."""
+        """Stream Bedrock with a pre-built Anthropic-compatible body.
+
+        Yields only text deltas. For structured event handling (e.g., tool_use),
+        prefer stream_body_events which yields provider NDJSON events.
+        """
         # IMPORTANT: compact JSON to avoid signature hash issues
         body_bytes = json.dumps(body, separators=(',', ':')).encode("utf-8")
         path = f"/model/{self.model_id}/invoke-with-response-stream"
@@ -416,6 +420,86 @@ class ManualSigV4Model:
                 text = self._first_text_from_response(data)
                 if text:
                     yield text
+
+    def stream_body_events(self, body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        """Stream Bedrock with a pre-built body and yield provider NDJSON events.
+
+        This returns structured provider events (e.g., content_block_start,
+        content_block_delta with input_json_delta/text_delta, content_block_stop,
+        message_*), allowing callers to implement tool streaming.
+        """
+        body_bytes = json.dumps(body, separators=(',', ':')).encode("utf-8")
+        path = f"/model/{self.model_id}/invoke-with-response-stream"
+        signed = self._build_signed_request(
+            method="POST",
+            path=path,
+            query_string="",
+            body=body_bytes,
+        )
+        headers = dict(signed["headers"])  # copy
+        headers.setdefault("accept", "application/vnd.amazon.eventstream")
+        headers["host"] = self.gateway_host
+        url = self._gateway_join(path)
+        if self.debug:
+            self._debug_request_preview(
+                where="stream-body-events-initial",
+                method="POST",
+                url=url,
+                headers=headers,
+                body=body_bytes,
+                signed_host=signed["headers"].get("host"),
+            )
+        with self.client.stream("POST", url, headers=headers, content=body_bytes) as r:
+            if r.status_code in (301, 302, 307, 308):
+                loc = r.headers.get("location") or r.headers.get("Location")
+                if loc:
+                    redirect_url = self._build_redirect_url(url, loc, path)
+                    if self.debug:
+                        print(f"[ManualSigV4] STREAM redirect {r.status_code} -> {redirect_url}")
+                    r.close()
+                    from urllib.parse import urlparse as _urlparse
+                    _redir_host = _urlparse(redirect_url).netloc
+                    _headers_redirect = dict(headers)
+                    _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
+                    self._debug_request_preview(
+                        where="stream-body-events-redirect",
+                        method="POST",
+                        url=redirect_url,
+                        headers=_headers_redirect,
+                        body=body_bytes,
+                        signed_host=signed["headers"].get("host"),
+                    )
+                    with self.client.stream("POST", redirect_url, headers=_headers_redirect, content=body_bytes) as r2:
+                        if r2.status_code >= 400:
+                            self._debug_http_error(r2, "stream body events redirect target")
+                        r2.raise_for_status()
+                        ctype = (r2.headers.get("content-type") or "").lower()
+                        if "application/vnd.amazon.eventstream" in ctype:
+                            yield from self._iter_eventstream_events(r2)
+                        else:
+                            try:
+                                data = r2.json()
+                            except Exception:
+                                data = {"raw": r2.text}
+                            # Surface as a single synthetic message_stop with text
+                            text = self._first_text_from_response(data)
+                            if text:
+                                yield {"type": "synthetic_text", "text": text}
+                    return
+            if r.status_code >= 400:
+                self._debug_http_error(r, "stream body events initial")
+            r.raise_for_status()
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "application/vnd.amazon.eventstream" in ctype:
+                yield from self._iter_eventstream_events(r)
+            else:
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw": r.text}
+                text = self._first_text_from_response(data)
+                if text:
+                    yield {"type": "synthetic_text", "text": text}
 
     # --- Internal helpers for streaming ---
     def _first_text_from_response(self, resp: Dict[str, Any]) -> str:
@@ -512,6 +596,69 @@ class ManualSigV4Model:
                 else:
                     # Unknown event type: ignore or surface minimal info
                     continue
+
+    def _iter_eventstream_events(self, response: httpx.Response) -> Iterator[Dict[str, Any]]:
+        """Decode AWS eventstream frames and yield provider NDJSON events as dicts."""
+        buf = bytearray()
+        for raw in response.iter_bytes():
+            if not raw:
+                continue
+            buf.extend(raw)
+            while True:
+                if len(buf) < 12:
+                    break
+                total_len = int.from_bytes(buf[0:4], "big")
+                headers_len = int.from_bytes(buf[4:8], "big")
+                if total_len <= 0 or len(buf) < total_len:
+                    break
+                pos = 12
+                pos += headers_len
+                payload_len = total_len - headers_len - 16
+                if payload_len < 0 or pos + payload_len + 4 > len(buf):
+                    break
+                payload = bytes(buf[pos:pos + payload_len])
+                del buf[:total_len]
+                try:
+                    ev = json.loads(payload.decode("utf-8"))
+                except Exception:
+                    continue
+                if isinstance(ev, dict) and "chunk" in ev and isinstance(ev["chunk"], dict):
+                    b64 = ev["chunk"].get("bytes")
+                    if isinstance(b64, str) and b64:
+                        try:
+                            provider_bytes = base64.b64decode(b64)
+                            for obj in self._iter_provider_events(provider_bytes):
+                                if obj:
+                                    yield obj
+                            if self._stream_should_stop:
+                                return
+                        except Exception:
+                            continue
+                elif isinstance(ev, dict) and "message" in ev:
+                    msg = ev.get("message")
+                    if isinstance(msg, dict):
+                        yield {"type": "synthetic_message", "message": msg}
+                else:
+                    continue
+
+    def _iter_provider_events(self, data: bytes) -> Iterator[Dict[str, Any]]:
+        """Iterate provider NDJSON and yield each parsed JSON object as a dict."""
+        try:
+            s = data.decode("utf-8", errors="ignore")
+        except Exception:
+            return
+        for line in s.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            # Track stop signal
+            if obj.get("type") == "message_stop":
+                self._stream_should_stop = True
+            yield obj
 
     def _iter_provider_stream(self, data: bytes) -> Iterator[str]:
         """Iterate over provider NDJSON events and yield text deltas.
@@ -866,8 +1013,20 @@ class ManualSigV4Adapter(BaseLlm):
         except Exception:
             tool_decls = []
 
-        # If tools are present, avoid streaming for now (bedrock stream tool_use handling is complex)
-        if tool_decls:
+        # Streaming defaults: enable streaming by default unless explicitly disabled
+        try:
+            stream_default = str(os.getenv("ADK_STREAM_DEFAULT", "1")).lower() in {"1", "true", "yes"}
+        except Exception:
+            stream_default = True
+        if not stream and stream_default:
+            stream = True
+
+        # If tools are present, allow streaming unless explicitly disabled
+        try:
+            allow_tool_stream = str(os.getenv("ADK_ALLOW_TOOL_STREAM", "1")).lower() in {"1", "true", "yes"}
+        except Exception:
+            allow_tool_stream = True
+        if tool_decls and not allow_tool_stream:
             stream = False
 
         # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides.
@@ -921,7 +1080,93 @@ class ManualSigV4Adapter(BaseLlm):
             yield _make_response(text, partial=False, turn_complete=True)
             return
 
-        # Streaming path: buffer pieces; if agent expects JSON, buffering ensures valid JSON at end
+        # Streaming path
+        if tool_decls and allow_tool_stream:
+            # Tool-aware streaming: parse provider events to surface function_call when complete
+            accumulated_text: list[str] = []
+            current_tool: Optional[Dict[str, Any]] = None  # {id, name, input_buf}
+
+            async def _iter_events():
+                for ev in self._client.stream_body_events(body):
+                    yield ev
+
+            async for ev in _iter_events():
+                if not isinstance(ev, dict):
+                    continue
+                etype = ev.get("type")
+
+                # Pass-through of plain text (synthetic or text_delta)
+                if etype == "synthetic_text":
+                    txt = ev.get("text") or ""
+                    if txt:
+                        accumulated_text.append(txt)
+                        yield _make_response(txt, partial=True, turn_complete=False)
+                    continue
+
+                if etype == "content_block_start":
+                    cb = ev.get("content_block") or {}
+                    if cb.get("type") == "tool_use":
+                        current_tool = {
+                            "id": cb.get("id") or "",
+                            "name": cb.get("name") or "",
+                            "input_buf": "",
+                        }
+                    continue
+
+                if etype == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    # text streaming before/after tool calls
+                    if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                        t = delta.get("text") or ""
+                        if t:
+                            accumulated_text.append(t)
+                            yield _make_response(t, partial=True, turn_complete=False)
+                        continue
+                    # tool input JSON streaming
+                    if delta.get("type") == "input_json_delta" and current_tool is not None:
+                        pj = delta.get("partial_json") or ""
+                        if isinstance(pj, str):
+                            current_tool["input_buf"] += pj
+                        continue
+
+                if etype == "content_block_stop":
+                    # If we're inside a tool_use block, finalize args and emit a function_call
+                    if current_tool is not None:
+                        args: Dict[str, Any]
+                        buf = current_tool.get("input_buf") or ""
+                        try:
+                            args = json.loads(buf) if buf else {}
+                        except Exception:
+                            args = {}
+
+                        part = genai_types.Part.from_function_call(
+                            name=str(current_tool.get("name") or ""),
+                            args=args,
+                        )
+                        # attach id if present
+                        try:
+                            if part.function_call is not None:
+                                part.function_call.id = current_tool.get("id") or None
+                        except Exception:
+                            pass
+                        content = genai_types.Content(role='model', parts=[part])
+                        # Yield the tool call and end the stream so ADK can execute the tool
+                        yield LlmResponse(content=content, partial=False, turn_complete=True)
+                        return
+                    continue
+
+                if etype == "message_stop":
+                    # End of message without a tool call
+                    final_text = "".join(accumulated_text)
+                    yield _make_response(final_text, partial=False, turn_complete=True)
+                    return
+
+            # Safety: if we exit the loop without explicit stop
+            final_text = "".join(accumulated_text)
+            yield _make_response(final_text, partial=False, turn_complete=True)
+            return
+
+        # Default text-only streaming (no tools)
         accumulated: list[str] = []
 
         async def _iter_stream():
@@ -1101,8 +1346,8 @@ def _coerce_to_json_string(text: str) -> str:
                     return json.dumps(obj, separators=(',', ':'))
                 except Exception:
                     continue
-    # Final fallback: return a minimal JSON object containing the raw text
-        return text
+    # Final fallback: return the original text (caller expects JSON string; upstream wraps when needed)
+    return text
 
 
 # --- Tooling support helpers (Anthropic on Bedrock) ---
