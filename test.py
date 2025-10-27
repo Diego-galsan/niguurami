@@ -997,6 +997,12 @@ class ManualSigV4Adapter(BaseLlm):
             tokens = ("event-stream", "message/stream", "sse", "stream")
             wants_stream_by_mime = any(t in response_mime for t in tokens)
 
+        # Optional debug of streaming decision
+        try:
+            debug_stream = str(os.getenv("ADK_DEBUG_STREAM", "1")).lower() in {"1", "true", "yes"}
+        except Exception:
+            debug_stream = True
+
         # Try to capture system instruction/description from multiple potential locations.
         # ADK typically injects `instruction` as a system message, but if not, look for config fields.
         sys_candidates = []
@@ -1030,13 +1036,43 @@ class ManualSigV4Adapter(BaseLlm):
             stream_default = str(os.getenv("ADK_STREAM_DEFAULT", "1")).lower() in {"1", "true", "yes"}
         except Exception:
             stream_default = True
-        # SOLO AUTO: cuando ADK_AUTO_STREAM_FROM_MIME está activo (default),
-        # decide exclusivamente por MIME y no aplica fallback por defecto.
+        # SOLO AUTO behavior: by default we honor MIME but also respect the runtime 'stream' flag
+        # if provided (so message/stream RPCs still stream even if MIME wasn't propagated).
+        # To enforce strict "MIME-only" mode, set ADK_SOLO_AUTO_STRICT=1.
+        try:
+            solo_auto_strict = str(os.getenv("ADK_SOLO_AUTO_STRICT", "0")).lower() in {"1", "true", "yes"}
+        except Exception:
+            solo_auto_strict = False
+        incoming_stream_arg = bool(stream)
         if auto_stream_from_mime:
-            stream = wants_stream_by_mime
+            if solo_auto_strict:
+                stream = wants_stream_by_mime
+            else:
+                # Prefer MIME signal but allow upstream to force streaming via stream=True
+                stream = wants_stream_by_mime or incoming_stream_arg
         else:
             if not stream and stream_default:
                 stream = True
+
+        if debug_stream:
+            try:
+                print(
+                    "[ManualSigV4Adapter] stream decision:",
+                    json.dumps(
+                        {
+                            "response_mime_type": response_mime,
+                            "auto_stream_from_mime": auto_stream_from_mime,
+                            "wants_stream_by_mime": wants_stream_by_mime,
+                            "incoming_stream_arg": incoming_stream_arg,
+                            "solo_auto_strict": solo_auto_strict,
+                            "expects_json": expects_json,
+                            "final_stream": stream,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            except Exception:
+                pass
 
         # If tools are present, allow streaming unless explicitly disabled
         try:
@@ -1286,25 +1322,37 @@ def _contents_to_anthropic_body(
             continue
 
         if role in {'user', 'model', 'assistant', None}:
-            mapped = 'user' if role in {None, 'user'} else 'assistant'
-            blocks: list[Dict[str, Any]] = []
+            # Split blocks by their semantic type so we can force the proper Anthropic role:
+            # - tool_use must be in an assistant message
+            # - tool_result must be in a user message
+            # - text stays with its original side (user/assistant)
+            text_blocks_user: list[Dict[str, Any]] = []
+            text_blocks_assistant: list[Dict[str, Any]] = []
+            tool_use_blocks: list[Dict[str, Any]] = []
+            tool_result_blocks: list[Dict[str, Any]] = []
+
             for p in parts:
                 # text
                 txt = getattr(p, 'text', None)
                 if isinstance(txt, str) and txt:
-                    blocks.append({'type': 'text', 'text': txt})
+                    if (role in {None, 'user'}):
+                        text_blocks_user.append({'type': 'text', 'text': txt})
+                    else:
+                        text_blocks_assistant.append({'type': 'text', 'text': txt})
                     continue
-                # function_call -> tool_use
+
+                # function_call -> tool_use (assistant)
                 fc = getattr(p, 'function_call', None)
                 if fc is not None and getattr(fc, 'name', None):
-                    blocks.append({
+                    tool_use_blocks.append({
                         'type': 'tool_use',
                         'id': getattr(fc, 'id', None) or '',
                         'name': fc.name,
                         'input': getattr(fc, 'args', None) or {},
                     })
                     continue
-                # function_response -> tool_result
+
+                # function_response -> tool_result (user)
                 fr = getattr(p, 'function_response', None)
                 if fr is not None and getattr(fr, 'name', None):
                     content_val = ''
@@ -1321,15 +1369,26 @@ def _contents_to_anthropic_body(
                             content_val = str(resp_obj)
                     except Exception:
                         content_val = ''
-                    blocks.append({
+                    tool_result_blocks.append({
                         'type': 'tool_result',
                         'tool_use_id': getattr(fr, 'id', None) or '',
                         'content': content_val,
                         'is_error': False,
                     })
                     continue
-            if blocks:
-                messages.append({'role': mapped, 'content': blocks})
+
+            # Emit messages in correct roles expected by Anthropic tools
+            if text_blocks_user:
+                messages.append({'role': 'user', 'content': text_blocks_user})
+            if tool_result_blocks:
+                messages.append({'role': 'user', 'content': tool_result_blocks})
+            if text_blocks_assistant or tool_use_blocks:
+                content_blocks = []
+                if text_blocks_assistant:
+                    content_blocks.extend(text_blocks_assistant)
+                if tool_use_blocks:
+                    content_blocks.extend(tool_use_blocks)
+                messages.append({'role': 'assistant', 'content': content_blocks})
         else:
             continue
 
