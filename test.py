@@ -950,12 +950,19 @@ class ManualSigV4Adapter(BaseLlm):
     model: str = "aws/bedrock.manual-sigv4"
     # runtime-only client
     _client: ManualSigV4Model = PrivateAttr()
+    # Keep a reference to the agent's tools for when ADK doesn't pass them
+    _agent_tools: Optional[List[Any]] = PrivateAttr(default=None)
 
     @classmethod
     def from_env(cls) -> "ManualSigV4Adapter":
         inst = cls()
         inst._client = ManualSigV4Model.from_env()
+        inst._agent_tools = None
         return inst
+    
+    def set_agent_tools(self, tools: List[Any]) -> None:
+        """Set the agent's tools manually as a fallback when ADK doesn't pass them."""
+        self._agent_tools = tools
 
     def complete(self, prompt: str, max_tokens: int = 256, temperature: float = 0.2) -> str:
         return self._client.complete(prompt, max_tokens=max_tokens, temperature=temperature)
@@ -1038,18 +1045,56 @@ class ManualSigV4Adapter(BaseLlm):
                     if hasattr(llm_request.config, 'tools'):
                         print(f"  - tools value: {llm_request.config.tools}")
                         print(f"  - tools type: {type(llm_request.config.tools)}")
+                    # Check for other possible tool locations
+                    for attr in ['tool_config', 'function_declarations', 'available_tools']:
+                        if hasattr(llm_request.config, attr):
+                            val = getattr(llm_request.config, attr)
+                            print(f"  - {attr}: {val} (type: {type(val)})")
+                # Check llm_request level too
+                for attr in ['tools', 'tool_config', 'function_declarations', 'available_tools']:
+                    if hasattr(llm_request, attr):
+                        val = getattr(llm_request, attr)
+                        print(f"  - llm_request.{attr}: {val} (type: {type(val)})")
             
+            # Try multiple locations for tools
+            # 1. Standard location: config.tools
             if getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tools', None):
                 tools_list = llm_request.config.tools or []
                 if tools_list and getattr(tools_list[0], 'function_declarations', None):
                     tool_decls = tools_list[0].function_declarations or []
                 elif debug_stream:
                     print(f"[ManualSigV4Adapter] tools_list exists but no function_declarations: {tools_list}")
+            # 2. Try config.tool_config
+            elif getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tool_config', None):
+                tc = llm_request.config.tool_config
+                if getattr(tc, 'function_declarations', None):
+                    tool_decls = tc.function_declarations or []
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] Found tools in config.tool_config: {len(tool_decls)} tools")
+            # 3. Try config.function_declarations directly
+            elif getattr(llm_request, 'config', None) and getattr(llm_request.config, 'function_declarations', None):
+                tool_decls = llm_request.config.function_declarations or []
+                if debug_stream:
+                    print(f"[ManualSigV4Adapter] Found tools in config.function_declarations: {len(tool_decls)} tools")
+            # 4. Try llm_request.tools directly
+            elif getattr(llm_request, 'tools', None):
+                tools_list = llm_request.tools or []
+                if tools_list and getattr(tools_list[0], 'function_declarations', None):
+                    tool_decls = tools_list[0].function_declarations or []
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] Found tools in llm_request.tools: {len(tool_decls)} tools")
+            # 5. FALLBACK: Use agent tools if set manually and nothing found above
+            elif self._agent_tools:
+                tool_decls = self._agent_tools
+                if debug_stream:
+                    print(f"[ManualSigV4Adapter] Using fallback agent tools: {len(tool_decls)} tools")
             elif debug_stream:
-                print(f"[ManualSigV4Adapter] No tools found in config")
+                print(f"[ManualSigV4Adapter] No tools found in any known location")
         except Exception as e:
             if debug_stream:
+                import traceback
                 print(f"[ManualSigV4Adapter] Exception extracting tools: {e}")
+                traceback.print_exc()
             tool_decls = []
 
         # Streaming defaults: enable streaming by default unless explicitly disabled
