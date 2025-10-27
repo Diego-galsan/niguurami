@@ -330,6 +330,93 @@ class ManualSigV4Model:
                 if text:
                     yield text
 
+    # --- Public JSON-aware helpers used by the ADK adapter ---
+    def invoke_body(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoke Bedrock with a pre-built Anthropic-compatible body.
+
+        This allows higher layers (e.g., ADK adapter) to pass system prompts and
+        multi-turn messages directly, ensuring any JSON-mode/system instructions
+        from the agent are preserved.
+        """
+        # Ensure compact JSON for consistent hashing/signing
+        payload = json.loads(json.dumps(body))  # shallow normalize
+        return self._invoke_bedrock(payload)
+
+    def stream_body(self, body: Dict[str, Any]) -> Iterator[str]:
+        """Stream Bedrock with a pre-built Anthropic-compatible body."""
+        # IMPORTANT: compact JSON to avoid signature hash issues
+        body_bytes = json.dumps(body, separators=(',', ':')).encode("utf-8")
+        path = f"/model/{self.model_id}/invoke-with-response-stream"
+        signed = self._build_signed_request(
+            method="POST",
+            path=path,
+            query_string="",
+            body=body_bytes,
+        )
+        headers = dict(signed["headers"])  # copy
+        headers.setdefault("accept", "application/vnd.amazon.eventstream")
+        headers["host"] = self.gateway_host
+        url = self._gateway_join(path)
+        if self.debug:
+            self._debug_request_preview(
+                where="stream-body-initial",
+                method="POST",
+                url=url,
+                headers=headers,
+                body=body_bytes,
+                signed_host=signed["headers"].get("host"),
+            )
+        with self.client.stream("POST", url, headers=headers, content=body_bytes) as r:
+            if r.status_code in (301, 302, 307, 308):
+                loc = r.headers.get("location") or r.headers.get("Location")
+                if loc:
+                    redirect_url = self._build_redirect_url(url, loc, path)
+                    if self.debug:
+                        print(f"[ManualSigV4] STREAM redirect {r.status_code} -> {redirect_url}")
+                    r.close()
+                    from urllib.parse import urlparse as _urlparse
+                    _redir_host = _urlparse(redirect_url).netloc
+                    _headers_redirect = dict(headers)
+                    _headers_redirect["host"] = self.gateway_host if _redir_host == self.gateway_host else self.vpc_host
+                    self._debug_request_preview(
+                        where="stream-body-redirect",
+                        method="POST",
+                        url=redirect_url,
+                        headers=_headers_redirect,
+                        body=body_bytes,
+                        signed_host=signed["headers"].get("host"),
+                    )
+                    with self.client.stream("POST", redirect_url, headers=_headers_redirect, content=body_bytes) as r2:
+                        if r2.status_code >= 400:
+                            self._debug_http_error(r2, "stream body redirect target")
+                        r2.raise_for_status()
+                        ctype = (r2.headers.get("content-type") or "").lower()
+                        if "application/vnd.amazon.eventstream" in ctype:
+                            yield from self._iter_eventstream_text(r2)
+                        else:
+                            try:
+                                data = r2.json()
+                            except Exception:
+                                data = {"raw": r2.text}
+                            text = self._first_text_from_response(data)
+                            if text:
+                                yield text
+                    return
+            if r.status_code >= 400:
+                self._debug_http_error(r, "stream body initial")
+            r.raise_for_status()
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "application/vnd.amazon.eventstream" in ctype:
+                yield from self._iter_eventstream_text(r)
+            else:
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw": r.text}
+                text = self._first_text_from_response(data)
+                if text:
+                    yield text
+
     # --- Internal helpers for streaming ---
     def _first_text_from_response(self, resp: Dict[str, Any]) -> str:
         # Anthropic-style messages
@@ -744,20 +831,32 @@ class ManualSigV4Adapter(BaseLlm):
         - Streaming: yield partial chunks as LlmResponse(partial=True), then a
           final LlmResponse(turn_complete=True).
         """
-        prompt = _contents_to_prompt(llm_request.contents)
         # Pull common params if user set them in config
         max_tokens = getattr(getattr(llm_request, 'config', None), 'max_output_tokens', 256) or 256
         temperature = getattr(getattr(llm_request, 'config', None), 'temperature', 0.2) or 0.2
+        response_mime = str(getattr(getattr(llm_request, 'config', None), 'response_mime_type', '') or '').lower()
+        expects_json = 'json' in response_mime
+
+        # Convert ADK contents into Anthropic-compatible body, preserving system prompts
+        body = _contents_to_anthropic_body(llm_request.contents, max_tokens=int(max_tokens), temperature=float(temperature))
+
+        # If JSON is expected, avoid streaming partial JSON fragments
+        if expects_json:
+            stream = False
 
         if not stream:
-            text = await asyncio.to_thread(self.complete, prompt, max_tokens, float(temperature))
+            data = await asyncio.to_thread(self._client.invoke_body, body)
+            text = self._client._first_text_from_response(data) or json.dumps(data)
+            if expects_json:
+                text = _coerce_to_json_string(text)
             yield _make_response(text, partial=False, turn_complete=True)
             return
 
-        # Streaming path
-        accumulated = []
+        # Streaming path: buffer pieces; if agent expects JSON, buffering ensures valid JSON at end
+        accumulated: list[str] = []
+
         async def _iter_stream():
-            for delta in self.stream_complete(prompt, max_tokens=max_tokens, temperature=float(temperature)):
+            for delta in self._client.stream_body(body):
                 yield delta
 
         async for delta in _iter_stream():
@@ -766,7 +865,6 @@ class ManualSigV4Adapter(BaseLlm):
             accumulated.append(delta)
             yield _make_response(delta, partial=True, turn_complete=False)
 
-        # Final message (optional, to indicate completion)
         final_text = "".join(accumulated)
         yield _make_response(final_text, partial=False, turn_complete=True)
 
@@ -778,7 +876,10 @@ class ManualSigV4Adapter(BaseLlm):
 
 # ---- Small helpers to bridge ADK types to our client ----
 def _contents_to_prompt(contents: List[genai_types.Content]) -> str:
-    """Extract a user-friendly prompt by concatenating text parts."""
+    """Extract a user-friendly prompt by concatenating text parts.
+
+    Kept for backward-compatibility; prefer _contents_to_anthropic_body.
+    """
     if not contents:
         return ""
     parts: List[str] = []
@@ -788,6 +889,53 @@ def _contents_to_prompt(contents: List[genai_types.Content]) -> str:
             if isinstance(txt, str) and txt:
                 parts.append(txt)
     return "\n\n".join(parts).strip()
+
+
+def _contents_to_anthropic_body(
+    contents: List[genai_types.Content], *, max_tokens: int, temperature: float
+) -> Dict[str, Any]:
+    """Build an Anthropic Bedrock messages body preserving roles and system prompt.
+
+    - Concatenates all system-role texts into a single 'system' string.
+    - Maps 'user' -> role 'user'; 'model' -> role 'assistant'. Other roles are ignored.
+    """
+    system_parts: list[str] = []
+    messages: list[Dict[str, Any]] = []
+
+    for c in contents or []:
+        role = getattr(c, 'role', None) or getattr(c, 'author', None)
+        role = str(role) if role else None
+        # Collect text parts
+        text_chunks: list[str] = []
+        for p in getattr(c, 'parts', []) or []:
+            txt = getattr(p, 'text', None)
+            if isinstance(txt, str) and txt:
+                text_chunks.append(txt)
+        if not text_chunks:
+            continue
+        text_blob = "\n\n".join(text_chunks)
+        if role == 'system':
+            system_parts.append(text_blob)
+        elif role in {'user', 'model', 'assistant', None}:
+            mapped = 'user' if role in {None, 'user'} else 'assistant'
+            messages.append({
+                'role': mapped,
+                'content': [{'type': 'text', 'text': text_blob}],
+            })
+        else:
+            # Ignore unknown roles (e.g., tool)
+            continue
+
+    body: Dict[str, Any] = {
+        'anthropic_version': 'bedrock-2023-05-31',
+        'messages': messages or [{'role': 'user', 'content': [{'type': 'text', 'text': ''}]}],
+        'max_tokens': max(1, int(max_tokens)),
+        'temperature': float(temperature),
+    }
+    system_text = "\n\n".join(system_parts).strip()
+    if system_text:
+        body['system'] = system_text
+    return body
 
 
 def _make_response(text: str, *, partial: bool, turn_complete: bool) -> LlmResponse:
@@ -800,3 +948,36 @@ def _make_response(text: str, *, partial: bool, turn_complete: bool) -> LlmRespo
         partial=partial,
         turn_complete=turn_complete,
     )
+
+
+def _coerce_to_json_string(text: str) -> str:
+    """Try to return a valid JSON string from a model's output.
+
+    - If text is valid JSON already, return it compacted.
+    - Otherwise, attempt to extract the first {...} or [...] block and return compact JSON.
+    - If all fails, return the original text.
+    """
+    try:
+        obj = json.loads(text)
+        return json.dumps(obj, separators=(',', ':'))
+    except Exception:
+        pass
+    # Naive extraction
+    start = None
+    end = None
+    for i, ch in enumerate(text):
+        if ch in '{[':
+            start = i
+            break
+    if start is not None:
+        # try from the end
+        for j in range(len(text)-1, start, -1):
+            if text[j] in '}]':
+                end = j + 1
+                snippet = text[start:end]
+                try:
+                    obj = json.loads(snippet)
+                    return json.dumps(obj, separators=(',', ':'))
+                except Exception:
+                    continue
+    return text
