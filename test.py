@@ -978,6 +978,10 @@ class ManualSigV4Adapter(BaseLlm):
         - Streaming: yield partial chunks as LlmResponse(partial=True), then a
           final LlmResponse(turn_complete=True).
         """
+        import asyncio
+        import threading
+        from queue import Queue
+        
         # Pull common params if user set them in config
         config = getattr(llm_request, 'config', None)
         max_tokens = getattr(config, 'max_output_tokens', 256) or 256
@@ -1024,11 +1028,28 @@ class ManualSigV4Adapter(BaseLlm):
         # Collect tool declarations (ADK tools, including MCP-backed ones)
         tool_decls = []
         try:
+            if debug_stream:
+                print(f"[ManualSigV4Adapter] Inspecting llm_request for tools...")
+                print(f"  - llm_request type: {type(llm_request)}")
+                print(f"  - hasattr config: {hasattr(llm_request, 'config')}")
+                if hasattr(llm_request, 'config') and llm_request.config:
+                    print(f"  - config type: {type(llm_request.config)}")
+                    print(f"  - hasattr tools: {hasattr(llm_request.config, 'tools')}")
+                    if hasattr(llm_request.config, 'tools'):
+                        print(f"  - tools value: {llm_request.config.tools}")
+                        print(f"  - tools type: {type(llm_request.config.tools)}")
+            
             if getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tools', None):
                 tools_list = llm_request.config.tools or []
                 if tools_list and getattr(tools_list[0], 'function_declarations', None):
                     tool_decls = tools_list[0].function_declarations or []
-        except Exception:
+                elif debug_stream:
+                    print(f"[ManualSigV4Adapter] tools_list exists but no function_declarations: {tools_list}")
+            elif debug_stream:
+                print(f"[ManualSigV4Adapter] No tools found in config")
+        except Exception as e:
+            if debug_stream:
+                print(f"[ManualSigV4Adapter] Exception extracting tools: {e}")
             tool_decls = []
 
         # Streaming defaults: enable streaming by default unless explicitly disabled
@@ -1166,12 +1187,8 @@ class ManualSigV4Adapter(BaseLlm):
             if debug_stream:
                 print(f"[ManualSigV4Adapter] Starting tool-aware streaming with {len(tool_decls)} tools")
 
-            # Use asyncio.Queue to properly stream from sync generator
-            import asyncio
-            import concurrent.futures
-            from queue import Queue
-            import threading
-            
+            # Use Queue to properly stream from sync generator
+            # (asyncio, threading, Queue already imported at top of function)
             event_queue: Queue = Queue()
             stop_event = threading.Event()
             exception_holder = []
@@ -1344,10 +1361,8 @@ class ManualSigV4Adapter(BaseLlm):
         
         accumulated: list[str] = []
 
-        # Use asyncio.Queue approach for text streaming too
-        import threading
-        from queue import Queue
-        
+        # Use Queue approach for text streaming too
+        # (threading, Queue already imported at top of function)
         text_queue: Queue = Queue()
         stop_event_text = threading.Event()
         exception_holder_text = []
@@ -1369,6 +1384,8 @@ class ManualSigV4Adapter(BaseLlm):
         text_producer_thread.start()
         
         # Consume deltas asynchronously
+        loop = asyncio.get_event_loop()
+        
         async def _get_text_delta():
             """Get delta from queue without blocking event loop."""
             return await loop.run_in_executor(None, text_queue.get)
