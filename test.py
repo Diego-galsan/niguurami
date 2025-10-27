@@ -975,6 +975,15 @@ class ManualSigV4Adapter(BaseLlm):
     def supported_models(cls) -> List[str]:
         # Not used by registry in our integration; return a permissive list
         return [".*"]
+    
+    def supports_function_calling(self) -> bool:
+        """Indicate to ADK that this model supports native function calling.
+        
+        This prevents ADK from falling back to text-based tool descriptions
+        in the system prompt and ensures tools are passed as structured objects
+        in llm_request.config.tools instead.
+        """
+        return True
 
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
@@ -1198,6 +1207,14 @@ class ManualSigV4Adapter(BaseLlm):
         except Exception:
             tool_args_delta_format = "text"
 
+        # CRITICAL DEBUG: Print tool_decls BEFORE building body
+        if debug_stream:
+            print(f"\n[ManualSigV4Adapter] BEFORE _contents_to_anthropic_body:")
+            print(f"  - tool_decls type: {type(tool_decls)}")
+            print(f"  - tool_decls length: {len(tool_decls) if tool_decls else 0}")
+            if tool_decls:
+                print(f"  - First 3 tools: {[getattr(t, 'name', '???') for t in tool_decls[:3]]}")
+
         # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides.
         # Also attach tools and tool_choice when provided.
         body = _contents_to_anthropic_body(
@@ -1211,13 +1228,14 @@ class ManualSigV4Adapter(BaseLlm):
         # Debug: print the body being sent to verify tools are included
         if debug_stream:
             try:
-                print("[ManualSigV4Adapter] Request body structure:")
+                print("\n[ManualSigV4Adapter] AFTER _contents_to_anthropic_body - Request body structure:")
                 print(f"  - messages: {len(body.get('messages', []))} messages")
                 print(f"  - tools: {len(body.get('tools', []))} tools")
                 if body.get('tools'):
-                    print(f"  - tool names: {[t.get('name') for t in body.get('tools', [])][:5]}")
+                    print(f"  - tool names: {[t.get('name') for t in body.get('tools', [])]}")
                 print(f"  - system prompt length: {len(body.get('system', ''))}")
                 print(f"  - max_tokens: {body.get('max_tokens')}")
+                print(f"  - Full tools payload: {json.dumps(body.get('tools', []), indent=2)[:500]}...")
                 print(f"  - temperature: {body.get('temperature')}")
             except Exception as e:
                 print(f"[ManualSigV4Adapter] Debug print failed: {e}")
