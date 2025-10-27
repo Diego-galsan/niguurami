@@ -1102,6 +1102,20 @@ class ManualSigV4Adapter(BaseLlm):
             tool_declarations=tool_decls,
         )
 
+        # Debug: print the body being sent to verify tools are included
+        if debug_stream:
+            try:
+                print("[ManualSigV4Adapter] Request body structure:")
+                print(f"  - messages: {len(body.get('messages', []))} messages")
+                print(f"  - tools: {len(body.get('tools', []))} tools")
+                if body.get('tools'):
+                    print(f"  - tool names: {[t.get('name') for t in body.get('tools', [])][:5]}")
+                print(f"  - system prompt length: {len(body.get('system', ''))}")
+                print(f"  - max_tokens: {body.get('max_tokens')}")
+                print(f"  - temperature: {body.get('temperature')}")
+            except Exception as e:
+                print(f"[ManualSigV4Adapter] Debug print failed: {e}")
+
         # Optional diagnostics to surface what JSON/schema the step may be asking for
         # Enable/disable with ADK_DEBUG_JSON env var (defaults to on for now)
         try:
@@ -1149,140 +1163,243 @@ class ManualSigV4Adapter(BaseLlm):
             accumulated_text: list[str] = []
             current_tool: Optional[Dict[str, Any]] = None  # {id, name, input_buf}
 
-            # Create async-compatible iterator from synchronous stream_body_events
-            events_gen = self._client.stream_body_events(body)
+            if debug_stream:
+                print(f"[ManualSigV4Adapter] Starting tool-aware streaming with {len(tool_decls)} tools")
+
+            # Use asyncio.Queue to properly stream from sync generator
+            import asyncio
+            import concurrent.futures
+            from queue import Queue
+            import threading
             
-            while True:
+            event_queue: Queue = Queue()
+            stop_event = threading.Event()
+            exception_holder = []
+            
+            def _producer():
+                """Run in thread: pull from sync generator and put into queue."""
                 try:
-                    # Get next event in a thread to avoid blocking the event loop
-                    ev = await asyncio.to_thread(lambda: next(events_gen, None))
-                    if ev is None:
+                    for ev in self._client.stream_body_events(body):
+                        if stop_event.is_set():
+                            break
+                        event_queue.put(('event', ev))
+                    event_queue.put(('done', None))
+                except Exception as e:
+                    exception_holder.append(e)
+                    event_queue.put(('error', e))
+            
+            # Start producer thread
+            producer_thread = threading.Thread(target=_producer, daemon=True)
+            producer_thread.start()
+            
+            # Consume events asynchronously
+            loop = asyncio.get_event_loop()
+            
+            async def _get_event():
+                """Get event from queue without blocking event loop."""
+                return await loop.run_in_executor(None, event_queue.get)
+            
+            try:
+                event_count = 0
+                while True:
+                    msg_type, ev = await _get_event()
+                    
+                    if msg_type == 'done':
+                        if debug_stream:
+                            print(f"[ManualSigV4Adapter] Stream completed, processed {event_count} events")
                         break
-                except StopIteration:
-                    break
-
-                if not isinstance(ev, dict):
-                    continue
-                etype = ev.get("type")
-
-                # Pass-through of plain text (synthetic or text_delta)
-                if etype == "synthetic_text":
-                    txt = ev.get("text") or ""
-                    if txt:
-                        accumulated_text.append(txt)
-                        yield _make_response(txt, partial=True, turn_complete=False)
-                    continue
-
-                if etype == "content_block_start":
-                    cb = ev.get("content_block") or {}
-                    if cb.get("type") == "tool_use":
-                        current_tool = {
-                            "id": cb.get("id") or "",
-                            "name": cb.get("name") or "",
-                            "input_buf": "",
-                        }
-                    continue
-
-                if etype == "content_block_delta":
-                    delta = ev.get("delta") or {}
-                    # text streaming before/after tool calls
-                    if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                        t = delta.get("text") or ""
-                        if t:
-                            accumulated_text.append(t)
-                            yield _make_response(t, partial=True, turn_complete=False)
+                    
+                    if msg_type == 'error':
+                        if debug_stream:
+                            print(f"[ManualSigV4Adapter] Stream error: {ev}")
+                        raise ev
+                    
+                    event_count += 1
+                    if debug_stream and event_count <= 10:
+                        print(f"[ManualSigV4Adapter] Event {event_count}: {ev.get('type') if isinstance(ev, dict) else type(ev)}")
+                    
+                    if not isinstance(ev, dict):
                         continue
-                    # tool input JSON streaming
-                    if delta.get("type") == "input_json_delta" and current_tool is not None:
-                        pj = delta.get("partial_json") or ""
-                        if isinstance(pj, str):
-                            current_tool["input_buf"] += pj
-                            # Optionally surface tool args deltas in real-time
-                            if emit_tool_args_deltas:
-                                if tool_args_delta_format == "text":
-                                    # Emit the raw partial JSON as text chunk; prefix with a lightweight marker
-                                    marker = f"[tool_args_delta:{current_tool.get('name') or ''}] "
-                                    yield _make_response(marker + pj, partial=True, turn_complete=False)
-                                elif tool_args_delta_format == "json":
-                                    # Try to parse current buffer; only emit when valid JSON snapshot
-                                    try:
-                                        snapshot = json.loads(current_tool["input_buf"])
-                                        part = genai_types.Part.from_function_call(
-                                            name=str(current_tool.get("name") or ""),
-                                            args=snapshot,
-                                        )
-                                        # Attach id if we have it
+                    etype = ev.get("type")
+
+                    # Pass-through of plain text (synthetic or text_delta)
+                    if etype == "synthetic_text":
+                        txt = ev.get("text") or ""
+                        if txt:
+                            if debug_stream:
+                                print(f"[ManualSigV4Adapter] Yielding synthetic text chunk: {repr(txt[:50])}")
+                            accumulated_text.append(txt)
+                            yield _make_response(txt, partial=True, turn_complete=False)
+                        continue
+
+                    if etype == "content_block_start":
+                        cb = ev.get("content_block") or {}
+                        if cb.get("type") == "tool_use":
+                            if debug_stream:
+                                print(f"[ManualSigV4Adapter] Tool use started: {cb.get('name')}")
+                            current_tool = {
+                                "id": cb.get("id") or "",
+                                "name": cb.get("name") or "",
+                                "input_buf": "",
+                            }
+                        continue
+
+                    if etype == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        # text streaming before/after tool calls
+                        if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                            t = delta.get("text") or ""
+                            if t:
+                                if debug_stream and event_count <= 10:
+                                    print(f"[ManualSigV4Adapter] Yielding text delta: {repr(t[:50])}")
+                                accumulated_text.append(t)
+                                yield _make_response(t, partial=True, turn_complete=False)
+                            continue
+                        # tool input JSON streaming
+                        if delta.get("type") == "input_json_delta" and current_tool is not None:
+                            pj = delta.get("partial_json") or ""
+                            if isinstance(pj, str):
+                                current_tool["input_buf"] += pj
+                                # Optionally surface tool args deltas in real-time
+                                if emit_tool_args_deltas:
+                                    if tool_args_delta_format == "text":
+                                        # Emit the raw partial JSON as text chunk; prefix with a lightweight marker
+                                        marker = f"[tool_args_delta:{current_tool.get('name') or ''}] "
+                                        yield _make_response(marker + pj, partial=True, turn_complete=False)
+                                    elif tool_args_delta_format == "json":
+                                        # Try to parse current buffer; only emit when valid JSON snapshot
                                         try:
-                                            if part.function_call is not None:
-                                                part.function_call.id = current_tool.get("id") or None
+                                            snapshot = json.loads(current_tool["input_buf"])
+                                            part = genai_types.Part.from_function_call(
+                                                name=str(current_tool.get("name") or ""),
+                                                args=snapshot,
+                                            )
+                                            # Attach id if we have it
+                                            try:
+                                                if part.function_call is not None:
+                                                    part.function_call.id = current_tool.get("id") or None
+                                            except Exception:
+                                                pass
+                                            yield LlmResponse(
+                                                content=genai_types.Content(role='model', parts=[part]),
+                                                partial=True,
+                                                turn_complete=False,
+                                            )
                                         except Exception:
+                                            # Ignore until JSON becomes valid
                                             pass
-                                        yield LlmResponse(
-                                            content=genai_types.Content(role='model', parts=[part]),
-                                            partial=True,
-                                            turn_complete=False,
-                                        )
-                                    except Exception:
-                                        # Ignore until JSON becomes valid
-                                        pass
+                            continue
+
+                    if etype == "content_block_stop":
+                        # If we're inside a tool_use block, finalize args and emit a function_call
+                        if current_tool is not None:
+                            if debug_stream:
+                                print(f"[ManualSigV4Adapter] Tool use stopped, finalizing: {current_tool.get('name')}")
+                            args: Dict[str, Any]
+                            buf = current_tool.get("input_buf") or ""
+                            try:
+                                args = json.loads(buf) if buf else {}
+                            except Exception:
+                                args = {}
+
+                            part = genai_types.Part.from_function_call(
+                                name=str(current_tool.get("name") or ""),
+                                args=args,
+                            )
+                            # attach id if present
+                            try:
+                                if part.function_call is not None:
+                                    part.function_call.id = current_tool.get("id") or None
+                            except Exception:
+                                pass
+                            content = genai_types.Content(role='model', parts=[part])
+                            # Yield the tool call and end the stream so ADK can execute the tool
+                            if debug_stream:
+                                print(f"[ManualSigV4Adapter] Yielding function_call for tool: {current_tool.get('name')}")
+                            yield LlmResponse(content=content, partial=False, turn_complete=True)
+                            return
                         continue
 
-                if etype == "content_block_stop":
-                    # If we're inside a tool_use block, finalize args and emit a function_call
-                    if current_tool is not None:
-                        args: Dict[str, Any]
-                        buf = current_tool.get("input_buf") or ""
-                        try:
-                            args = json.loads(buf) if buf else {}
-                        except Exception:
-                            args = {}
-
-                        part = genai_types.Part.from_function_call(
-                            name=str(current_tool.get("name") or ""),
-                            args=args,
-                        )
-                        # attach id if present
-                        try:
-                            if part.function_call is not None:
-                                part.function_call.id = current_tool.get("id") or None
-                        except Exception:
-                            pass
-                        content = genai_types.Content(role='model', parts=[part])
-                        # Yield the tool call and end the stream so ADK can execute the tool
-                        yield LlmResponse(content=content, partial=False, turn_complete=True)
+                    if etype == "message_stop":
+                        # End of message without a tool call
+                        if debug_stream:
+                            print(f"[ManualSigV4Adapter] Message stop, accumulated {len(accumulated_text)} chunks")
+                        final_text = "".join(accumulated_text)
+                        yield _make_response(final_text, partial=False, turn_complete=True)
                         return
-                    continue
-
-                if etype == "message_stop":
-                    # End of message without a tool call
-                    final_text = "".join(accumulated_text)
-                    yield _make_response(final_text, partial=False, turn_complete=True)
-                    return
+            finally:
+                # Ensure producer thread stops
+                stop_event.set()
 
             # Safety: if we exit the loop without explicit stop
+            if debug_stream:
+                print(f"[ManualSigV4Adapter] Loop exited without message_stop")
             final_text = "".join(accumulated_text)
             yield _make_response(final_text, partial=False, turn_complete=True)
             return
 
         # Default text-only streaming (no tools)
+        if debug_stream:
+            print("[ManualSigV4Adapter] Starting text-only streaming (no tools)")
+        
         accumulated: list[str] = []
 
-        # Create an async generator from the synchronous stream_body iterator
-        # by wrapping each iteration in asyncio.to_thread
-        stream_gen = self._client.stream_body(body)
+        # Use asyncio.Queue approach for text streaming too
+        import threading
+        from queue import Queue
         
-        while True:
+        text_queue: Queue = Queue()
+        stop_event_text = threading.Event()
+        exception_holder_text = []
+        
+        def _text_producer():
+            """Run in thread: pull text deltas from sync generator and put into queue."""
             try:
-                # Get next delta in a thread to avoid blocking the event loop
-                delta = await asyncio.to_thread(lambda: next(stream_gen, None))
-                if delta is None:
+                for delta in self._client.stream_body(body):
+                    if stop_event_text.is_set():
+                        break
+                    text_queue.put(('delta', delta))
+                text_queue.put(('done', None))
+            except Exception as e:
+                exception_holder_text.append(e)
+                text_queue.put(('error', e))
+        
+        # Start producer thread
+        text_producer_thread = threading.Thread(target=_text_producer, daemon=True)
+        text_producer_thread.start()
+        
+        # Consume deltas asynchronously
+        async def _get_text_delta():
+            """Get delta from queue without blocking event loop."""
+            return await loop.run_in_executor(None, text_queue.get)
+        
+        try:
+            chunk_count = 0
+            while True:
+                msg_type, delta = await _get_text_delta()
+                
+                if msg_type == 'done':
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] Text streaming completed, {chunk_count} chunks")
                     break
+                
+                if msg_type == 'error':
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] Text stream error: {delta}")
+                    raise delta
+                
                 if not delta:
                     continue
+                
+                chunk_count += 1
+                if debug_stream and chunk_count <= 10:
+                    print(f"[ManualSigV4Adapter] Text chunk {chunk_count}: {repr(delta[:50])}")
+                
                 accumulated.append(delta)
                 yield _make_response(delta, partial=True, turn_complete=False)
-            except StopIteration:
-                break
+        finally:
+            # Ensure producer thread stops
+            stop_event_text.set()
 
         final_text = "".join(accumulated)
         yield _make_response(final_text, partial=False, turn_complete=True)
