@@ -832,13 +832,51 @@ class ManualSigV4Adapter(BaseLlm):
           final LlmResponse(turn_complete=True).
         """
         # Pull common params if user set them in config
-        max_tokens = getattr(getattr(llm_request, 'config', None), 'max_output_tokens', 256) or 256
-        temperature = getattr(getattr(llm_request, 'config', None), 'temperature', 0.2) or 0.2
-        response_mime = str(getattr(getattr(llm_request, 'config', None), 'response_mime_type', '') or '').lower()
+        config = getattr(llm_request, 'config', None)
+        max_tokens = getattr(config, 'max_output_tokens', 256) or 256
+        temperature = getattr(config, 'temperature', 0.2) or 0.2
+        response_mime = str(getattr(config, 'response_mime_type', '') or '').lower()
         expects_json = 'json' in response_mime
 
-        # Convert ADK contents into Anthropic-compatible body, preserving system prompts
-        body = _contents_to_anthropic_body(llm_request.contents, max_tokens=int(max_tokens), temperature=float(temperature))
+        # Try to capture system instruction/description from multiple potential locations.
+        # ADK typically injects `instruction` as a system message, but if not, look for config fields.
+        sys_candidates = []
+        for obj in (llm_request, config):
+            if not obj:
+                continue
+            # Common field names we might see
+            for attr in ('system_instruction', 'instruction', 'instructions', 'system', 'systemPrompt'):
+                val = getattr(obj, attr, None)
+                if isinstance(val, str) and val.strip():
+                    sys_candidates.append(val.strip())
+            # Description is not always fed to the model, but the user asked for it.
+            desc = getattr(obj, 'description', None)
+            if isinstance(desc, str) and desc.strip():
+                sys_candidates.append(desc.strip())
+
+        system_override = "\n\n".join(dict.fromkeys(sys_candidates)) if sys_candidates else None
+
+        # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides
+        body = _contents_to_anthropic_body(
+            llm_request.contents,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            system_override=system_override,
+        )
+
+        # Optional diagnostics to surface what JSON/schema the step may be asking for
+        # Enable/disable with ADK_DEBUG_JSON env var (defaults to on for now)
+        try:
+            debug_json = str(os.getenv("ADK_DEBUG_JSON", "1")).lower() in {"1", "true", "yes"}
+        except Exception:
+            debug_json = False
+        if debug_json and expects_json:
+            try:
+                sys_text = body.get('system', '') if isinstance(body, dict) else ''
+                preview = (sys_text or '')[:512]
+                print("[ManualSigV4Adapter] JSON-mode detected; system instruction preview (first 512 chars):\n", preview)
+            except Exception:
+                pass
 
         # If JSON is expected, avoid streaming partial JSON fragments
         if expects_json:
@@ -892,7 +930,7 @@ def _contents_to_prompt(contents: List[genai_types.Content]) -> str:
 
 
 def _contents_to_anthropic_body(
-    contents: List[genai_types.Content], *, max_tokens: int, temperature: float
+    contents: List[genai_types.Content], *, max_tokens: int, temperature: float, system_override: Optional[str] = None
 ) -> Dict[str, Any]:
     """Build an Anthropic Bedrock messages body preserving roles and system prompt.
 
@@ -932,6 +970,9 @@ def _contents_to_anthropic_body(
         'max_tokens': max(1, int(max_tokens)),
         'temperature': float(temperature),
     }
+    # If caller provided overrides, append them after the collected system parts
+    if isinstance(system_override, str) and system_override.strip():
+        system_parts.append(system_override.strip())
     system_text = "\n\n".join(system_parts).strip()
     if system_text:
         body['system'] = system_text
@@ -955,7 +996,7 @@ def _coerce_to_json_string(text: str) -> str:
 
     - If text is valid JSON already, return it compacted.
     - Otherwise, attempt to extract the first {...} or [...] block and return compact JSON.
-    - If all fails, return the original text.
+    - If all fails, wrap the original text in a minimal JSON object so callers always receive JSON.
     """
     try:
         obj = json.loads(text)
@@ -980,4 +1021,9 @@ def _coerce_to_json_string(text: str) -> str:
                     return json.dumps(obj, separators=(',', ':'))
                 except Exception:
                     continue
-    return text
+    # Final fallback: return a minimal JSON object containing the raw text
+    try:
+        return json.dumps({"text": text})
+    except Exception:
+        # Extremely unlikely; as a last resort, quote the string
+        return json.dumps({"text": str(text)})
