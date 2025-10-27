@@ -856,12 +856,28 @@ class ManualSigV4Adapter(BaseLlm):
 
         system_override = "\n\n".join(dict.fromkeys(sys_candidates)) if sys_candidates else None
 
-        # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides
+        # Collect tool declarations (ADK tools, including MCP-backed ones)
+        tool_decls = []
+        try:
+            if getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tools', None):
+                tools_list = llm_request.config.tools or []
+                if tools_list and getattr(tools_list[0], 'function_declarations', None):
+                    tool_decls = tools_list[0].function_declarations or []
+        except Exception:
+            tool_decls = []
+
+        # If tools are present, avoid streaming for now (bedrock stream tool_use handling is complex)
+        if tool_decls:
+            stream = False
+
+        # Convert ADK contents into Anthropic-compatible body, preserving system prompts and optionally appending overrides.
+        # Also attach tools and tool_choice when provided.
         body = _contents_to_anthropic_body(
             llm_request.contents,
             max_tokens=int(max_tokens),
             temperature=float(temperature),
             system_override=system_override,
+            tool_declarations=tool_decls,
         )
 
         # Optional diagnostics to surface what JSON/schema the step may be asking for
@@ -884,6 +900,21 @@ class ManualSigV4Adapter(BaseLlm):
 
         if not stream:
             data = await asyncio.to_thread(self._client.invoke_body, body)
+            # If tools are in play, return structured parts (function_call/text) so ADK can execute tools (incl. MCP)
+            if tool_decls:
+                llm_resp = _anthropic_json_to_llm_response(data)
+                if expects_json and llm_resp and llm_resp.content and llm_resp.content.parts:
+                    # If JSON requested but model provided text, coerce that text-only last part
+                    coerced_parts: list[genai_types.Part] = []
+                    for p in llm_resp.content.parts:
+                        if p.text is not None:
+                            coerced_parts.append(genai_types.Part.from_text(text=_coerce_to_json_string(p.text)))
+                        else:
+                            coerced_parts.append(p)
+                    llm_resp.content = genai_types.Content(role='model', parts=coerced_parts)
+                yield llm_resp if llm_resp else _make_response(json.dumps(data), partial=False, turn_complete=True)
+                return
+            # default text flow
             text = self._client._first_text_from_response(data) or json.dumps(data)
             if expects_json:
                 text = _coerce_to_json_string(text)
@@ -930,7 +961,7 @@ def _contents_to_prompt(contents: List[genai_types.Content]) -> str:
 
 
 def _contents_to_anthropic_body(
-    contents: List[genai_types.Content], *, max_tokens: int, temperature: float, system_override: Optional[str] = None
+    contents: List[genai_types.Content], *, max_tokens: int, temperature: float, system_override: Optional[str] = None, tool_declarations: Optional[List[Any]] = None
 ) -> Dict[str, Any]:
     """Build an Anthropic Bedrock messages body preserving roles and system prompt.
 
@@ -943,25 +974,63 @@ def _contents_to_anthropic_body(
     for c in contents or []:
         role = getattr(c, 'role', None) or getattr(c, 'author', None)
         role = str(role) if role else None
-        # Collect text parts
-        text_chunks: list[str] = []
-        for p in getattr(c, 'parts', []) or []:
-            txt = getattr(p, 'text', None)
-            if isinstance(txt, str) and txt:
-                text_chunks.append(txt)
-        if not text_chunks:
+        parts = getattr(c, 'parts', []) or []
+        if not parts:
             continue
-        text_blob = "\n\n".join(text_chunks)
         if role == 'system':
-            system_parts.append(text_blob)
-        elif role in {'user', 'model', 'assistant', None}:
+            # Concatenate system text parts only
+            for p in parts:
+                txt = getattr(p, 'text', None)
+                if isinstance(txt, str) and txt:
+                    system_parts.append(txt)
+            continue
+
+        if role in {'user', 'model', 'assistant', None}:
             mapped = 'user' if role in {None, 'user'} else 'assistant'
-            messages.append({
-                'role': mapped,
-                'content': [{'type': 'text', 'text': text_blob}],
-            })
+            blocks: list[Dict[str, Any]] = []
+            for p in parts:
+                # text
+                txt = getattr(p, 'text', None)
+                if isinstance(txt, str) and txt:
+                    blocks.append({'type': 'text', 'text': txt})
+                    continue
+                # function_call -> tool_use
+                fc = getattr(p, 'function_call', None)
+                if fc is not None and getattr(fc, 'name', None):
+                    blocks.append({
+                        'type': 'tool_use',
+                        'id': getattr(fc, 'id', None) or '',
+                        'name': fc.name,
+                        'input': getattr(fc, 'args', None) or {},
+                    })
+                    continue
+                # function_response -> tool_result
+                fr = getattr(p, 'function_response', None)
+                if fr is not None and getattr(fr, 'name', None):
+                    content_val = ''
+                    try:
+                        resp_obj = getattr(fr, 'response', None) or {}
+                        if isinstance(resp_obj, dict):
+                            if 'result' in resp_obj and resp_obj['result'] is not None:
+                                content_val = str(resp_obj['result'])
+                            elif 'output' in resp_obj and resp_obj['output'] is not None:
+                                content_val = str(resp_obj['output'])
+                            else:
+                                content_val = json.dumps(resp_obj)
+                        else:
+                            content_val = str(resp_obj)
+                    except Exception:
+                        content_val = ''
+                    blocks.append({
+                        'type': 'tool_result',
+                        'tool_use_id': getattr(fr, 'id', None) or '',
+                        'content': content_val,
+                        'is_error': False,
+                    })
+                    continue
+            if blocks:
+                messages.append({'role': mapped, 'content': blocks})
         else:
-            # Ignore unknown roles (e.g., tool)
             continue
 
     body: Dict[str, Any] = {
@@ -976,6 +1045,17 @@ def _contents_to_anthropic_body(
     system_text = "\n\n".join(system_parts).strip()
     if system_text:
         body['system'] = system_text
+    # Attach tools if provided (Anthropic tool-use for Bedrock)
+    tools_payload: List[Dict[str, Any]] = []
+    if tool_declarations:
+        for fd in tool_declarations:
+            try:
+                tools_payload.append(_function_decl_to_anthropic_tool_param(fd))
+            except Exception:
+                continue
+        if tools_payload:
+            body['tools'] = tools_payload
+            body['tool_choice'] = {'type': 'auto'}
     return body
 
 
@@ -1022,8 +1102,122 @@ def _coerce_to_json_string(text: str) -> str:
                 except Exception:
                     continue
     # Final fallback: return a minimal JSON object containing the raw text
+        return text
+
+
+# --- Tooling support helpers (Anthropic on Bedrock) ---
+def _update_type_string_in_schema_dict(value_dict: Dict[str, Any]) -> None:
+    """Normalize 'type' fields to lower-case; recurse into nested items/properties."""
     try:
-        return json.dumps({"text": text})
+        if not isinstance(value_dict, dict):
+            return
+        if 'type' in value_dict and isinstance(value_dict['type'], str):
+            value_dict['type'] = value_dict['type'].lower()
+        if 'items' in value_dict and isinstance(value_dict['items'], dict):
+            _update_type_string_in_schema_dict(value_dict['items'])
+        if 'properties' in value_dict and isinstance(value_dict['properties'], dict):
+            for _, v in list(value_dict['properties'].items()):
+                if isinstance(v, dict):
+                    _update_type_string_in_schema_dict(v)
     except Exception:
-        # Extremely unlikely; as a last resort, quote the string
-        return json.dumps({"text": str(text)})
+        return
+
+
+def _function_decl_to_anthropic_tool_param(fd: Any) -> Dict[str, Any]:
+    """Convert google.genai.types.FunctionDeclaration -> Anthropic tool JSON.
+
+    Output shape:
+    {"name": str, "description": str, "input_schema": {"type":"object","properties":{...}}}
+    """
+    name = getattr(fd, 'name', None)
+    if not name:
+        raise ValueError('FunctionDeclaration missing name')
+    description = getattr(fd, 'description', '') or ''
+
+    # Prefer explicit JSON schema if provided
+    params_json = getattr(fd, 'parameters_json_schema', None)
+    if isinstance(params_json, dict) and params_json:
+        schema_obj = dict(params_json)
+        _update_type_string_in_schema_dict(schema_obj)
+        input_schema = schema_obj
+    else:
+        # Build from Schema(properties)
+        props: Dict[str, Any] = {}
+        params = getattr(fd, 'parameters', None)
+        if params and getattr(params, 'properties', None):
+            for key, value in (params.properties or {}).items():
+                try:
+                    vdict = value.model_dump(exclude_none=True)
+                except Exception:
+                    try:
+                        vdict = dict(value)
+                    except Exception:
+                        continue
+                _update_type_string_in_schema_dict(vdict)
+                props[key] = vdict
+        input_schema = {
+            'type': 'object',
+            'properties': props,
+        }
+
+    return {
+        'name': name,
+        'description': description,
+        'input_schema': input_schema,
+    }
+
+
+def _anthropic_block_to_part(block: Dict[str, Any]) -> Optional[genai_types.Part]:
+    """Map Anthropic message content block (Bedrock) to google.genai Part."""
+    try:
+        btype = block.get('type')
+        if btype == 'text':
+            return genai_types.Part.from_text(text=str(block.get('text', '')))
+        if btype == 'tool_use':
+            name = block.get('name') or ''
+            args = block.get('input') or {}
+            part = genai_types.Part.from_function_call(name=name, args=args)
+            # attach id if present
+            try:
+                if part.function_call is not None:
+                    part.function_call.id = block.get('id') or None
+            except Exception:
+                pass
+            return part
+    except Exception:
+        return None
+    return None
+
+
+def _anthropic_json_to_llm_response(resp: Dict[str, Any]) -> Optional[LlmResponse]:
+    """Convert Bedrock Anthropic JSON response into an LlmResponse with parts.
+
+    Supports both direct Anthropic message shape and Converse wrapper shape.
+    """
+    try:
+        # Normalize to message dict with 'content' list
+        message = None
+        if isinstance(resp, dict):
+            if 'content' in resp:
+                message = resp
+            elif 'output' in resp and isinstance(resp['output'], dict):
+                message = resp['output'].get('message') or resp.get('message')
+        if not isinstance(message, dict):
+            # Fallback: try to extract single text
+            text = resp.get('outputText') if isinstance(resp, dict) else None
+            if isinstance(text, str):
+                return _make_response(text, partial=False, turn_complete=True)
+            return None
+
+        parts: List[genai_types.Part] = []
+        for block in message.get('content', []) or []:
+            if isinstance(block, dict):
+                p = _anthropic_block_to_part(block)
+                if p is not None:
+                    parts.append(p)
+
+        return LlmResponse(
+            content=genai_types.Content(role='model', parts=parts),
+        )
+    except Exception:
+        return None
