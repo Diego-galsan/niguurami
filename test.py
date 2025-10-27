@@ -139,7 +139,7 @@ class ManualSigV4Model:
         secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
         session_token = os.getenv("AWS_SESSION_TOKEN")
         vpc_endpoint_url = os.getenv("AWS_BEDROCK_VPC_ENDPOINT", "").strip()
-        model_id = os.getenv("AWS_BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1")
+        model_id = os.getenv("AWS_BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
         gateway_url = os.getenv("CORPORATE_GATEWAY_URL") or os.getenv("CORPORATE_PROXY", "")
         verify_tls = str(os.getenv("PROXY_SSL_VERIFY", "true")).lower() not in {"0", "false", "no"}
         # Force debug logs for now (hardcoded as requested). Revert to env-based toggle later.
@@ -482,6 +482,8 @@ class ManualSigV4Model:
 
         # Send to Host B (Application Gateway) joining base gateway path with Bedrock path
         url = self._gateway_join(path)
+        headers = dict(signed["headers"])  # copy to avoid mutating signed headers
+        headers["host"] = self.gateway_host
         if self.debug:
             print("[ManualSigV4] POST ->", url)
             print("[ManualSigV4] Signed Host (VPC):", signed["headers"].get("host"))
@@ -498,8 +500,6 @@ class ManualSigV4Model:
         # Important: We SIGN with the VPC host, but we SEND with the gateway host.
         # Gateways often require Host to match their own name; they should
         # restore the original Host (VPC) when forwarding to AWS.
-        headers = dict(signed["headers"])  # copy to avoid mutating signed headers
-        headers["host"] = self.gateway_host
         r = self.client.post(
             url,
             headers=headers,
