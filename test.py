@@ -1036,60 +1036,100 @@ class ManualSigV4Adapter(BaseLlm):
         tool_decls = []
         try:
             if debug_stream:
-                print(f"[ManualSigV4Adapter] Inspecting llm_request for tools...")
+                print(f"\n{'='*80}")
+                print(f"[ManualSigV4Adapter] TOOL EXTRACTION DEBUG")
+                print(f"{'='*80}")
                 print(f"  - llm_request type: {type(llm_request)}")
                 print(f"  - hasattr config: {hasattr(llm_request, 'config')}")
+                
+                # Check if tools_dict exists (ADK internal)
+                if hasattr(llm_request, 'tools_dict'):
+                    td = llm_request.tools_dict
+                    print(f"  - tools_dict exists: {len(td) if td else 0} tools")
+                    if td:
+                        print(f"    - Tool names in tools_dict: {list(td.keys())}")
+                
                 if hasattr(llm_request, 'config') and llm_request.config:
                     print(f"  - config type: {type(llm_request.config)}")
+                    print(f"  - config object: {llm_request.config}")
                     print(f"  - hasattr tools: {hasattr(llm_request.config, 'tools')}")
                     if hasattr(llm_request.config, 'tools'):
-                        print(f"  - tools value: {llm_request.config.tools}")
-                        print(f"  - tools type: {type(llm_request.config.tools)}")
+                        tools_val = llm_request.config.tools
+                        print(f"  - tools value: {tools_val}")
+                        print(f"  - tools type: {type(tools_val)}")
+                        if tools_val is not None:
+                            print(f"  - tools length: {len(tools_val) if hasattr(tools_val, '__len__') else 'N/A'}")
+                            if hasattr(tools_val, '__iter__') and tools_val:
+                                for idx, tool in enumerate(tools_val):
+                                    print(f"    - Tool[{idx}]: {tool}")
+                                    if hasattr(tool, 'function_declarations'):
+                                        print(f"      - function_declarations: {tool.function_declarations}")
                     # Check for other possible tool locations
                     for attr in ['tool_config', 'function_declarations', 'available_tools']:
                         if hasattr(llm_request.config, attr):
                             val = getattr(llm_request.config, attr)
-                            print(f"  - {attr}: {val} (type: {type(val)})")
+                            print(f"  - config.{attr}: {val} (type: {type(val)})")
                 # Check llm_request level too
                 for attr in ['tools', 'tool_config', 'function_declarations', 'available_tools']:
                     if hasattr(llm_request, attr):
                         val = getattr(llm_request, attr)
                         print(f"  - llm_request.{attr}: {val} (type: {type(val)})")
+                
+                print(f"{'='*80}\n")
             
             # Try multiple locations for tools
+            # 0. FIRST: Try tools_dict (ADK internal storage)
+            if hasattr(llm_request, 'tools_dict') and llm_request.tools_dict:
+                # tools_dict is a dict[str, BaseTool] maintained by ADK
+                # We need to get declarations from each tool
+                try:
+                    from google.adk.tools.base_tool import BaseTool
+                    for tool_name, tool_obj in llm_request.tools_dict.items():
+                        if isinstance(tool_obj, BaseTool):
+                            decl = tool_obj._get_declaration()
+                            if decl:
+                                tool_decls.append(decl)
+                    if debug_stream and tool_decls:
+                        print(f"[ManualSigV4Adapter] ✓ Found {len(tool_decls)} tools in tools_dict")
+                except Exception as e:
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] Error extracting from tools_dict: {e}")
+            
             # 1. Standard location: config.tools
-            if getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tools', None):
+            if not tool_decls and getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tools', None):
                 tools_list = llm_request.config.tools or []
                 if tools_list and getattr(tools_list[0], 'function_declarations', None):
                     tool_decls = tools_list[0].function_declarations or []
+                    if debug_stream:
+                        print(f"[ManualSigV4Adapter] ✓ Found {len(tool_decls)} tools in config.tools[0].function_declarations")
                 elif debug_stream:
                     print(f"[ManualSigV4Adapter] tools_list exists but no function_declarations: {tools_list}")
             # 2. Try config.tool_config
-            elif getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tool_config', None):
+            elif not tool_decls and getattr(llm_request, 'config', None) and getattr(llm_request.config, 'tool_config', None):
                 tc = llm_request.config.tool_config
                 if getattr(tc, 'function_declarations', None):
                     tool_decls = tc.function_declarations or []
                     if debug_stream:
-                        print(f"[ManualSigV4Adapter] Found tools in config.tool_config: {len(tool_decls)} tools")
+                        print(f"[ManualSigV4Adapter] ✓ Found {len(tool_decls)} tools in config.tool_config")
             # 3. Try config.function_declarations directly
-            elif getattr(llm_request, 'config', None) and getattr(llm_request.config, 'function_declarations', None):
+            elif not tool_decls and getattr(llm_request, 'config', None) and getattr(llm_request.config, 'function_declarations', None):
                 tool_decls = llm_request.config.function_declarations or []
                 if debug_stream:
-                    print(f"[ManualSigV4Adapter] Found tools in config.function_declarations: {len(tool_decls)} tools")
+                    print(f"[ManualSigV4Adapter] ✓ Found {len(tool_decls)} tools in config.function_declarations")
             # 4. Try llm_request.tools directly
-            elif getattr(llm_request, 'tools', None):
+            elif not tool_decls and getattr(llm_request, 'tools', None):
                 tools_list = llm_request.tools or []
                 if tools_list and getattr(tools_list[0], 'function_declarations', None):
                     tool_decls = tools_list[0].function_declarations or []
                     if debug_stream:
-                        print(f"[ManualSigV4Adapter] Found tools in llm_request.tools: {len(tool_decls)} tools")
+                        print(f"[ManualSigV4Adapter] ✓ Found {len(tool_decls)} tools in llm_request.tools")
             # 5. FALLBACK: Use agent tools if set manually and nothing found above
-            elif self._agent_tools:
+            elif not tool_decls and self._agent_tools:
                 tool_decls = self._agent_tools
                 if debug_stream:
-                    print(f"[ManualSigV4Adapter] Using fallback agent tools: {len(tool_decls)} tools")
+                    print(f"[ManualSigV4Adapter] ✓ Using fallback agent tools: {len(tool_decls)} tools")
             elif debug_stream:
-                print(f"[ManualSigV4Adapter] No tools found in any known location")
+                print(f"[ManualSigV4Adapter] ✗ No tools found in any known location")
         except Exception as e:
             if debug_stream:
                 import traceback
